@@ -1,0 +1,8 @@
+*.zip
+*.txt
+!requirements.txt
+data/
+pads_dataset/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
