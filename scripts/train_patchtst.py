@@ -209,13 +209,13 @@ for fold_idx, fold in enumerate(folds):
 
     print(f"\n{'='*55}\nFOLD {fold_idx+1}/{C.N_SPLITS}\n{'='*55}")
 
-    train_mask        = np.isin(subject_ids, fold['train_subjects'])
-    val_mask          = np.isin(subject_ids, fold['val_subjects'])
-    test_mask_relaxed = np.isin(subject_ids, fold['test_subjects']) & relaxed_rw_mask
+    train_mask  = np.isin(subject_ids, fold['train_subjects'])
+    val_mask   = np.isin(subject_ids, fold['val_subjects'])
+    test_mask  = np.isin(subject_ids, fold['test_subjects'])
 
     train_win, train_lab = windows[train_mask], labels[train_mask]
     val_win,   val_lab   = windows[val_mask],   labels[val_mask]
-    test_win,  test_lab  = windows[test_mask_relaxed], labels[test_mask_relaxed]
+    test_win,  test_lab  = windows[test_mask], labels[test_mask]
 
     mean, std = compute_normalization_stats(train_win)
     train_win = apply_normalization(train_win, mean, std)
