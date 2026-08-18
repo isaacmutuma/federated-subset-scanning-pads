@@ -3,11 +3,7 @@ train_boss_svm.py
 -----------------
 BOSS (Bag of SFA Symbols) + Linear SVM classifier for PADS IMU windows.
 Classical baseline — CPU only, no GPU needed.
-
-Follows Varghese et al. 2024 PADS paper approach:
-- BOSS transformer applied per channel with window sizes [20, 40, 80]
-- Features concatenated across all 6 channels and all window sizes
-- Linear SVM with class balancing
+Pure numpy implementation — no pyts dependency.
 
 Run:
     python scripts/train_boss_svm.py
@@ -18,7 +14,7 @@ warnings.filterwarnings('ignore')
 
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
+from collections import Counter
 from sklearn.svm import LinearSVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
@@ -43,16 +39,6 @@ from src.data.preprocessing import (bandpass_filter, segment_windows,
 from src.data.folds import generate_fold_splits
 from src.training.metrics import (compute_metrics, aggregate_fold_metrics,
                                    print_fold_results, print_summary)
-
-# ── Install pyts if needed ────────────────────────────────────────────────────
-try:
-    from pyts.transformation import BOSS
-except ImportError:
-    print("Installing pyts...")
-    os.system('pip install -q pyts')
-    from pyts.transformation import BOSS
-
-print("BOSS ready.")
 
 os.makedirs(C.OUTPUT_DIR,  exist_ok=True)
 os.makedirs(C.CKPT_DIR,    exist_ok=True)
@@ -133,7 +119,7 @@ for _, row in filtered.iterrows():
     all_labels_out.extend([LABEL_MAP[row['label']]] * len(wins))
     all_subject_ids.extend([int(row['patient_id'])] * len(wins))
 
-windows     = np.concatenate(all_windows, axis=0)  # (N, 6, 200)
+windows     = np.concatenate(all_windows, axis=0)
 labels      = np.array(all_labels_out,  dtype=np.int64)
 subject_ids = np.array(all_subject_ids, dtype=np.int64)
 
@@ -147,52 +133,105 @@ folds = generate_fold_splits(unique_subjects, subject_labels,
                               val_fraction=0.2,
                               save_path=osp.join(C.OUTPUT_DIR, 'fold_splits.pkl'))
 
-# ── BOSS feature extraction ───────────────────────────────────────────────────
-# window_sizes as in Varghese et al. 2024: [20, 40, 80] sub-window sizes
+# ── BOSS implementation (pure numpy) ─────────────────────────────────────────
 BOSS_WINDOW_SIZES = [20, 40, 80]
-BOSS_WORD_SIZE    = 4    # SFA word length
-BOSS_N_BINS       = 4    # alphabet size
+BOSS_WORD_SIZE    = 4
+BOSS_N_BINS       = 4
 
-def extract_boss_features(X, window_sizes, word_size, n_bins, fitted_bosses=None):
+
+def fit_boss_channel(X_ch, window_size, word_size, n_bins):
+    """Fit BOSS breakpoints on one channel via equidepth binning of DFT coeffs."""
+    n_samples, n_timesteps = X_ch.shape
+    all_coeffs = []
+    step = max(1, window_size // 2)
+    for i in range(n_samples):
+        for start in range(0, n_timesteps - window_size + 1, step):
+            sub = X_ch[i, start:start + window_size]
+            dft = np.fft.rfft(sub)[:word_size]
+            all_coeffs.append(np.real(dft))
+    all_coeffs  = np.array(all_coeffs)           # (n_windows_total, word_size)
+    breakpoints = np.percentile(
+        all_coeffs,
+        np.linspace(0, 100, n_bins + 1)[1:-1],
+        axis=0
+    )                                              # (n_bins-1, word_size)
+    return breakpoints
+
+
+def transform_boss_channel(X_ch, window_size, word_size, breakpoints):
+    """Transform one channel to BOSS bag-of-words (list of Counter)."""
+    n_samples, n_timesteps = X_ch.shape
+    step = max(1, window_size // 2)
+    bags = []
+    for i in range(n_samples):
+        bag       = Counter()
+        prev_word = None
+        for start in range(0, n_timesteps - window_size + 1, step):
+            sub     = X_ch[i, start:start + window_size]
+            dft     = np.fft.rfft(sub)[:word_size]
+            coeffs  = np.real(dft)
+            letters = tuple(
+                np.searchsorted(breakpoints[:, j], coeffs[j], side='right')
+                for j in range(word_size)
+            )
+            if letters != prev_word:
+                bag[letters] += 1
+                prev_word = letters
+        bags.append(bag)
+    return bags
+
+
+def bags_to_matrix(bags, vocab=None):
+    """Convert list of Counter to dense numpy matrix."""
+    if vocab is None:
+        vocab = sorted(set(k for b in bags for k in b.keys()))
+    vocab_idx = {k: i for i, k in enumerate(vocab)}
+    X = np.zeros((len(bags), max(1, len(vocab))), dtype=np.float32)
+    for i, bag in enumerate(bags):
+        for k, v in bag.items():
+            if k in vocab_idx:
+                X[i, vocab_idx[k]] = v
+    return X, vocab
+
+
+def extract_boss_features(X, window_sizes, word_size, n_bins, fitted_params=None):
     """
-    Extract BOSS features per channel per window size.
+    Extract BOSS features for all channels and window sizes.
 
     Parameters
     ----------
-    X              : np.ndarray (n_samples, n_channels, n_timesteps)
-    window_sizes   : list of int — BOSS sub-window sizes
-    word_size      : int — SFA word length
-    n_bins         : int — alphabet size
-    fitted_bosses  : list or None — if None, fit new BOSS transformers
+    X             : np.ndarray (n_samples, n_channels, n_timesteps)
+    window_sizes  : list of int
+    word_size     : int
+    n_bins        : int
+    fitted_params : list of (breakpoints, vocab) or None
 
     Returns
     -------
-    features       : np.ndarray (n_samples, n_features)
-    bosses         : list of fitted BOSS objects (one per channel per window size)
+    features      : np.ndarray (n_samples, total_features)
+    params_out    : list of (breakpoints, vocab)
     """
-    n_samples, n_channels, n_timesteps = X.shape
+    n_samples, n_channels, _ = X.shape
     all_features = []
-    bosses_out   = [] if fitted_bosses is None else None
+    params_out   = [] if fitted_params is None else None
+    param_idx    = 0
 
-    boss_idx = 0
     for ws in window_sizes:
         for ch in range(n_channels):
-            X_ch = X[:, ch, :]   # (n_samples, n_timesteps)
-            if fitted_bosses is None:
-                boss = BOSS(word_size=word_size, n_bins=n_bins,
-                            window_size=ws, sparse=False)
-                esult = boss.fit_transform(X_ch)
-                feats = result.toarray() if sp.issparse(result) else np.array(result)
-                bosses_out.append(boss)
+            X_ch = X[:, ch, :]
+            if fitted_params is None:
+                bp         = fit_boss_channel(X_ch, ws, word_size, n_bins)
+                bags       = transform_boss_channel(X_ch, ws, word_size, bp)
+                feats, vocab = bags_to_matrix(bags)
+                params_out.append((bp, vocab))
             else:
-                boss  = fitted_bosses[boss_idx]
-                result = boss.transform(X_ch)
-                feats = result.toarray() if sp.issparse(result) else np.array(result)
-                boss_idx += 1
+                bp, vocab  = fitted_params[param_idx]
+                bags       = transform_boss_channel(X_ch, ws, word_size, bp)
+                feats, _   = bags_to_matrix(bags, vocab=vocab)
+                param_idx += 1
             all_features.append(feats)
 
-    features = np.hstack(all_features)   # (n_samples, total_features)
-    return features, bosses_out
+    return np.hstack(all_features), params_out
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -208,12 +247,10 @@ for fold_idx, fold in enumerate(folds):
     train_win, train_lab = windows[train_mask], labels[train_mask]
     test_win,  test_lab  = windows[test_mask],  labels[test_mask]
 
-    # Normalize
     mean, std = compute_normalization_stats(train_win)
     train_win = apply_normalization(train_win, mean, std)
     test_win  = apply_normalization(test_win,  mean, std)
 
-    # Oversample HC
     hc_idx = np.where(train_lab == 0)[0]
     pd_idx = np.where(train_lab == 1)[0]
     hc_os  = resample(hc_idx, replace=True, n_samples=len(pd_idx), random_state=C.RANDOM_STATE)
@@ -224,31 +261,28 @@ for fold_idx, fold in enumerate(folds):
     print(f"Train: {train_win.shape[0]:,}  HC={(train_lab==0).sum():,}  PD={(train_lab==1).sum():,}")
     print(f"Test:  {test_win.shape[0]:,}   HC={(test_lab==0).sum():,}   PD={(test_lab==1).sum():,}")
 
-    # Extract BOSS features
     print("Extracting BOSS features (train)...")
-    X_train, fitted_bosses = extract_boss_features(
+    X_train, fitted_params = extract_boss_features(
         train_win, BOSS_WINDOW_SIZES, BOSS_WORD_SIZE, BOSS_N_BINS)
 
     print("Extracting BOSS features (test)...")
     X_test, _ = extract_boss_features(
         test_win, BOSS_WINDOW_SIZES, BOSS_WORD_SIZE, BOSS_N_BINS,
-        fitted_bosses=fitted_bosses)
+        fitted_params=fitted_params)
 
-    print(f"Feature vectors: train={X_train.shape}  test={X_test.shape}")
+    print(f"Features: train={X_train.shape}  test={X_test.shape}")
 
-    # Scale
     scaler  = StandardScaler(with_mean=True)
     X_train = scaler.fit_transform(X_train)
     X_test  = scaler.transform(X_test)
 
-    # Linear SVM with probability calibration for AUC
     print("Training Linear SVM...")
-    svm  = LinearSVC(C=1.0, class_weight='balanced', max_iter=2000, random_state=C.RANDOM_STATE)
-    clf  = CalibratedClassifierCV(svm, cv=3)
+    svm = LinearSVC(C=1.0, class_weight='balanced', max_iter=2000,
+                    random_state=C.RANDOM_STATE)
+    clf = CalibratedClassifierCV(svm, cv=3)
     clf.fit(X_train, train_lab)
 
-    scores = clf.predict_proba(X_test)[:, 1]
-
+    scores  = clf.predict_proba(X_test)[:, 1]
     metrics = compute_metrics(test_lab, scores)
     fold_metrics.append(metrics)
     print_fold_results(fold_idx, metrics)
