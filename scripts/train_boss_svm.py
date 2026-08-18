@@ -18,6 +18,7 @@ warnings.filterwarnings('ignore')
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from sklearn.svm import LinearSVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
@@ -180,11 +181,13 @@ def extract_boss_features(X, window_sizes, word_size, n_bins, fitted_bosses=None
             if fitted_bosses is None:
                 boss = BOSS(word_size=word_size, n_bins=n_bins,
                             window_size=ws, sparse=False)
-                feats = boss.fit_transform(X_ch).toarray()
+                esult = boss.fit_transform(X_ch)
+                feats = result.toarray() if sp.issparse(result) else np.array(result)
                 bosses_out.append(boss)
             else:
                 boss  = fitted_bosses[boss_idx]
-                feats = boss.transform(X_ch).toarray()
+                result = boss.transform(X_ch)
+                feats = result.toarray() if sp.issparse(result) else np.array(result)
                 boss_idx += 1
             all_features.append(feats)
 
