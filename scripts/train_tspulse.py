@@ -157,8 +157,10 @@ class TSPulseDataset(Dataset):
         return len(self.windows)
 
     def __getitem__(self, idx):
-        # TSPulse expects (seq_len, n_channels) per sample
-        x = self.windows[idx].permute(1, 0)   # (200, 6)
+        import torch.nn.functional as F
+        # TSPulse expects (seq_len, n_channels) per sample, padded to 512
+        x = self.windows[idx].permute(1, 0)          # (200, 6)
+        x = F.pad(x, (0, 0, 0, 312))                 # (512, 6)
         return {'past_values': x, 'target_values': self.labels[idx]}
 
 
@@ -255,7 +257,7 @@ for fold_idx, fold in enumerate(folds):
         for param in model.backbone.fft_encoding.parameters():
             param.requires_grad = True
         # Always train the classification head
-        for param in model.head.parameters():
+        for param in model.decoder_with_head.parameters():
             param.requires_grad = True
 
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
