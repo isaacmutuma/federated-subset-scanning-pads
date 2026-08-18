@@ -175,7 +175,7 @@ for fold_idx, fold in enumerate(folds):
 
     # ── Fit MiniROCKET ────────────────────────────────────────────────────────
     print("Fitting MiniROCKET...")
-    rocket = MiniRocket(num_kernels=10000, random_state=C.RANDOM_STATE)
+    rocket = MiniRocket(num_kernels=C.ROCKET_KERNELS, random_state=C.RANDOM_STATE)
     rocket.fit(train_win)
 
     print("Transforming train...")

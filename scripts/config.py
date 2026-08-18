@@ -64,6 +64,7 @@ N_WINDOWS    = 10
 FS           = 100.0
 LOWCUT       = 1.0
 HIGHCUT      = 20.0
+ROCKET_KERNELS = 1000
 
 # ── Create directories ─────────────────────────────────────────────────────────
 for d in [OUTPUT_DIR, CKPT_DIR, RESULTS_DIR]:
