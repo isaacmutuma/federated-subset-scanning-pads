@@ -1,9 +1,9 @@
 """
 train_tspulse.py
 ----------------
-TSPulse (IBM Granite) fine-tuned classifier for PADS IMU windows.
-Uses TSPulseForClassification with frozen backbone + unfrozen patch embeddings.
-GPU-free inference supported but GPU recommended for fine-tuning speed.
+TSPulse (IBM Granite) full fine-tuning for PADS IMU windows.
+Full backbone unfrozen — trains end-to-end with lower LR.
+Pretrained weights provide better initialisation than random.
 
 Run:
     python scripts/train_tspulse.py
@@ -16,15 +16,14 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from sklearn.utils import resample
 
-# ── Load config ───────────────────────────────────────────────────────────────
 SCRIPT_DIR = osp.dirname(osp.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 import config as C
 
-# ── Repo setup ────────────────────────────────────────────────────────────────
 if not osp.exists(C.REPO_DIR):
     os.system(f'git clone https://github.com/isaacmutuma/federated-subset-scanning-pads.git {C.REPO_DIR}')
 else:
@@ -39,7 +38,6 @@ from src.data.folds import generate_fold_splits
 from src.training.metrics import (compute_metrics, aggregate_fold_metrics,
                                    print_fold_results, print_summary)
 
-# ── Install granite-tsfm if needed ───────────────────────────────────────────
 try:
     from tsfm_public.models.tspulse import TSPulseForClassification
 except ImportError:
@@ -54,14 +52,10 @@ os.makedirs(C.OUTPUT_DIR,  exist_ok=True)
 os.makedirs(C.CKPT_DIR,    exist_ok=True)
 os.makedirs(C.RESULTS_DIR, exist_ok=True)
 
-# ── Extract zip if needed ─────────────────────────────────────────────────────
 if C.PADS_ZIP and not osp.exists(C.PADS_ROOT):
-    print(f"Extracting {C.PADS_ZIP} ...")
     with zipfile.ZipFile(C.PADS_ZIP, 'r') as z:
         z.extractall(C.PADS_ROOT)
-    print("Done.")
 
-# ── Find dataset root ─────────────────────────────────────────────────────────
 def find_pads_root(base):
     for root, dirs, files in os.walk(base):
         if 'movement' in dirs and 'patients' in dirs:
@@ -74,7 +68,6 @@ OBSERVATION_DIR = osp.join(BASE_PATH, 'movement')
 PATIENTS_DIR    = osp.join(BASE_PATH, 'patients')
 print(f"PADS root: {BASE_PATH}")
 
-# ── Build manifest ────────────────────────────────────────────────────────────
 def get_patient_label(patient_id):
     path = osp.join(PATIENTS_DIR, f'patient_{int(patient_id):03d}.json')
     with open(path) as f:
@@ -111,7 +104,6 @@ print(f'HC="{HC_STR}"  PD="{PD_STR}"')
 filtered = manifest[manifest['label'].isin([HC_STR, PD_STR])].copy()
 print(f'Subjects: {filtered["patient_id"].nunique()}  Rows: {len(filtered)}')
 
-# ── Window recordings ─────────────────────────────────────────────────────────
 all_windows, all_labels_out, all_subject_ids = [], [], []
 skipped = 0
 print("Windowing recordings...")
@@ -132,7 +124,6 @@ windows     = np.concatenate(all_windows, axis=0)
 labels      = np.array(all_labels_out,  dtype=np.int64)
 subject_ids = np.array(all_subject_ids, dtype=np.int64)
 print(f"Windows: {windows.shape}  HC={(labels==0).sum()}  PD={(labels==1).sum()}")
-print(f"Skipped: {skipped}")
 
 unique_subjects = np.unique(subject_ids)
 subject_labels  = np.array([labels[subject_ids == s][0] for s in unique_subjects])
@@ -141,13 +132,11 @@ folds = generate_fold_splits(unique_subjects, subject_labels,
                               val_fraction=0.2,
                               save_path=osp.join(C.OUTPUT_DIR, 'fold_splits.pkl'))
 
-# ── TSPulse dataset wrapper ───────────────────────────────────────────────────
+# ── Dataset wrapper ───────────────────────────────────────────────────────────
 class TSPulseDataset(Dataset):
     """
-    Wraps numpy windows into format expected by TSPulseForClassification.
-    TSPulse expects input shape: (batch, seq_len, n_channels)
-    Our windows are: (batch, n_channels, seq_len) = (batch, 6, 200)
-    So we permute on __getitem__.
+    Pads windows from (6, 200) → (512, 6) for TSPulse.
+    TSPulse requires: (batch, seq_len=512, n_channels=6)
     """
     def __init__(self, windows, labels):
         self.windows = torch.tensor(windows, dtype=torch.float32)
@@ -157,15 +146,13 @@ class TSPulseDataset(Dataset):
         return len(self.windows)
 
     def __getitem__(self, idx):
-        import torch.nn.functional as F
-        # TSPulse expects (seq_len, n_channels) per sample, padded to 512
-        x = self.windows[idx].permute(1, 0)          # (200, 6)
-        x = F.pad(x, (0, 0, 0, 312))                 # (512, 6)
+        x = self.windows[idx].permute(1, 0)      # (200, 6)
+        x = F.pad(x, (0, 0, 0, 312))             # (512, 6)
         return {'past_values': x, 'target_values': self.labels[idx]}
 
 
-# ── Load TSPulse classification model ────────────────────────────────────────
-config_dict = {
+# ── Model config ──────────────────────────────────────────────────────────────
+MODEL_CONFIG = {
     'head_reduce_d_model': 1,
     'decoder_mode': 'mix_channel',
     'head_gated_attention_activation': 'softmax',
@@ -174,25 +161,18 @@ config_dict = {
     'loss': 'cross_entropy',
     'disable_mask_in_classification_eval': True,
     'ignore_mismatched_sizes': True,
-    'num_input_channels': 6,    # 6 IMU channels
-    'num_targets': 2,           # HC vs PD
+    'num_input_channels': 6,
+    'num_targets': 2,
 }
 
-print("Loading TSPulse classification model...")
-base_model = TSPulseForClassification.from_pretrained(
-    'ibm-granite/granite-timeseries-tspulse-r1',
-    revision='tspulse-block-dualhead-512-p16-r1',
-    **config_dict
-)
-print(f"TSPulse loaded. Params: {sum(p.numel() for p in base_model.parameters()):,}")
+# ── Hyperparameters ───────────────────────────────────────────────────────────
+TS_PATIENCE   = 20
+TS_MAX_EPOCHS = 80
+TS_LR         = 5e-5    # lower LR — full fine-tuning of pretrained backbone
+TS_BATCH      = 32
 
 # ── Training ──────────────────────────────────────────────────────────────────
 RESULTS_FILE = osp.join(C.RESULTS_DIR, 'tspulse_results.json')
-TS_PATIENCE   = 15
-TS_MAX_EPOCHS = 50
-TS_LR         = 1e-4
-TS_BATCH      = 32
-
 fold_metrics = []
 
 for fold_idx, fold in enumerate(folds):
@@ -230,44 +210,43 @@ for fold_idx, fold in enumerate(folds):
     test_loader  = DataLoader(TSPulseDataset(test_win,  test_lab),
                               batch_size=TS_BATCH, shuffle=False)
 
-    # ── Skip if checkpoint exists ─────────────────────────────────────────────
+    # Skip if checkpoint exists
     if osp.exists(ckpt_path):
         print(f"Checkpoint found — skipping training for fold {fold_idx+1}")
         model = TSPulseForClassification.from_pretrained(
             'ibm-granite/granite-timeseries-tspulse-r1',
             revision='tspulse-block-dualhead-512-p16-r1',
-            **config_dict
+            **MODEL_CONFIG
         )
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         model = model.to(device)
         model.eval()
     else:
-        # ── Fresh model for this fold ─────────────────────────────────────────
+        # ── Full fine-tuning — all parameters trainable ───────────────────────
         model = TSPulseForClassification.from_pretrained(
             'ibm-granite/granite-timeseries-tspulse-r1',
             revision='tspulse-block-dualhead-512-p16-r1',
-            **config_dict
+            **MODEL_CONFIG
         ).to(device)
 
-        # Freeze backbone — only train patch embedding layers
-        for param in model.backbone.parameters():
-            param.requires_grad = False
-        for param in model.backbone.time_encoding.parameters():
-            param.requires_grad = True
-        for param in model.backbone.fft_encoding.parameters():
-            param.requires_grad = True
-        # Always train the classification head
-        for param in model.decoder_with_head.parameters():
+        # Unfreeze everything — pretrained weights are a better init than random
+        for param in model.parameters():
             param.requires_grad = True
 
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Trainable params: {trainable:,}")
+        total = sum(p.numel() for p in model.parameters())
+        print(f"Trainable params: {total:,} (full fine-tuning)")
 
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=TS_LR, weight_decay=1e-2
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=TS_LR, weight_decay=1e-2)
+
+        # Linear warmup for 5 epochs, then cosine decay
+        def lr_lambda(epoch):
+            warmup = 5
+            if epoch < warmup:
+                return (epoch + 1) / warmup
+            progress = (epoch - warmup) / max(1, TS_MAX_EPOCHS - warmup)
+            return 0.5 * (1 + np.cos(np.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
         best_val_loss    = float('inf')
         patience_counter = 0
