@@ -1,8 +1,11 @@
 """
 train_patchtst.py
 -----------------
-PatchTST training script. All paths and hyperparameters come from config.py.
-To switch environments, edit config.py only — never touch this file.
+PatchTST training + subject-level evaluation for PADS IMU windows.
+All paths and hyperparameters from config.py.
+
+Key: evaluation aggregates per-window probabilities to subject level
+(mean pooling), matching Varghese et al. 2024 evaluation protocol.
 
 Run:
     python scripts/train_patchtst.py
@@ -19,7 +22,6 @@ from sklearn.utils import resample
 import pandas as pd
 
 # ── Load config ───────────────────────────────────────────────────────────────
-# Config is always at scripts/config.py relative to this file
 SCRIPT_DIR = osp.dirname(osp.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 import config as C
@@ -136,8 +138,7 @@ wrists      = np.array(all_wrists)
 
 relaxed_rw_mask = (tasks == 'Relaxed') & (wrists == 'RightWrist')
 print(f"Windows: {windows.shape}  HC={(labels==0).sum()}  PD={(labels==1).sum()}")
-print(f"Relaxed+RW: {relaxed_rw_mask.sum()}  "
-      f"(HC={((labels==0)&relaxed_rw_mask).sum()}  PD={((labels==1)&relaxed_rw_mask).sum()})")
+print(f"Relaxed+RW: {relaxed_rw_mask.sum()}")
 print(f"Skipped: {skipped}")
 
 unique_subjects = np.unique(subject_ids)
@@ -212,19 +213,21 @@ for fold_idx, fold in enumerate(folds):
 
     print(f"\n{'='*55}\nFOLD {fold_idx+1}/{C.N_SPLITS}\n{'='*55}")
 
-    train_mask  = np.isin(subject_ids, fold['train_subjects'])
+    train_mask = np.isin(subject_ids, fold['train_subjects'])
     val_mask   = np.isin(subject_ids, fold['val_subjects'])
     test_mask  = np.isin(subject_ids, fold['test_subjects'])
 
     train_win, train_lab = windows[train_mask], labels[train_mask]
     val_win,   val_lab   = windows[val_mask],   labels[val_mask]
-    test_win,  test_lab  = windows[test_mask], labels[test_mask]
+    test_win,  test_lab  = windows[test_mask],  labels[test_mask]
+    test_subj            = subject_ids[test_mask]
 
     mean, std = compute_normalization_stats(train_win)
     train_win = apply_normalization(train_win, mean, std)
     val_win   = apply_normalization(val_win,   mean, std)
     test_win  = apply_normalization(test_win,  mean, std)
 
+    # Oversample HC to balance training
     hc_idx = np.where(train_lab == 0)[0]
     pd_idx = np.where(train_lab == 1)[0]
     hc_os  = resample(hc_idx, replace=True, n_samples=len(pd_idx), random_state=C.RANDOM_STATE)
@@ -234,101 +237,105 @@ for fold_idx, fold in enumerate(folds):
 
     train_loader = DataLoader(PADSDataset(train_win, train_lab),
                               batch_size=C.BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader   = DataLoader(PADSDataset(val_win, val_lab),
+    val_loader   = DataLoader(PADSDataset(val_win,   val_lab),
                               batch_size=C.BATCH_SIZE, shuffle=False)
-    test_loader  = DataLoader(PADSDataset(test_win, test_lab),
+    test_loader  = DataLoader(PADSDataset(test_win,  test_lab),
                               batch_size=C.BATCH_SIZE, shuffle=False)
 
-    # ── Skip fold if checkpoint already exists ────────────────────────────────
+    # ── Skip fold if checkpoint exists ────────────────────────────────────────
     if osp.exists(ckpt_path):
         print(f"Checkpoint found — skipping training for fold {fold_idx+1}")
         model = PatchTSTClassifier().to(device)
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         model.eval()
-        all_probs, all_true = [], []
-        with torch.no_grad():
-            for x, y in test_loader:
-                probs = torch.softmax(model(x.to(device)), dim=1)[:, 1]
-                all_probs.append(probs.cpu().numpy())
-                all_true.append(y.numpy())
-        metrics = compute_metrics(np.concatenate(all_true), np.concatenate(all_probs))
-        fold_metrics.append(metrics)
-        print_fold_results(fold_idx, metrics)
-        with open(RESULTS_FILE, 'w') as f:
-            json.dump({'fold_metrics': fold_metrics,
-                       'folds_complete': fold_idx + 1}, f, indent=2)
-        continue
+    else:
+        # ── Train from scratch ────────────────────────────────────────────────
+        print(f"Train: {train_win.shape[0]:,}  HC={(train_lab==0).sum():,}  PD={(train_lab==1).sum():,}")
+        print(f"Val:   {val_win.shape[0]:,}    Test: {test_win.shape[0]:,}")
 
-    # ── Train from scratch ────────────────────────────────────────────────────
-    print(f"Train: {train_win.shape[0]:,}  HC={(train_lab==0).sum():,}  PD={(train_lab==1).sum():,}")
-    print(f"Val:   {val_win.shape[0]:,}    Test: {test_win.shape[0]}  "
-          f"HC={(test_lab==0).sum()}  PD={(test_lab==1).sum()}")
+        model     = PatchTSTClassifier().to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=C.LR, weight_decay=C.WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=C.T_MAX)
+        criterion = nn.CrossEntropyLoss()
 
-    model     = PatchTSTClassifier().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=C.LR, weight_decay=C.WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=C.T_MAX)
-    criterion = nn.CrossEntropyLoss()
+        best_val_loss    = float('inf')
+        patience_counter = 0
 
-    best_val_loss    = float('inf')
-    patience_counter = 0
-
-    for epoch in range(1, C.MAX_EPOCHS + 1):
-        model.train()
-        train_loss = 0.0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(x), y)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            train_loss += loss.item() * len(x)
-        train_loss /= len(train_loader.dataset)
-        scheduler.step()
-
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for x, y in val_loader:
+        for epoch in range(1, C.MAX_EPOCHS + 1):
+            model.train()
+            train_loss = 0.0
+            for x, y in train_loader:
                 x, y = x.to(device), y.to(device)
-                val_loss += criterion(model(x), y).item() * len(x)
-        val_loss /= len(val_loader.dataset)
-        print(f"Epoch {epoch:3d}/{C.MAX_EPOCHS}  Train: {train_loss:.4f}  Val: {val_loss:.4f}")
+                optimizer.zero_grad()
+                loss = criterion(model(x), y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                train_loss += loss.item() * len(x)
+            train_loss /= len(train_loader.dataset)
+            scheduler.step()
 
-        if val_loss < best_val_loss:
-            best_val_loss    = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), ckpt_path)
-        else:
-            patience_counter += 1
-            if patience_counter >= C.PATIENCE:
-                print(f"Early stopping at epoch {epoch}  (best val: {best_val_loss:.4f})")
-                break
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for x, y in val_loader:
+                    x, y = x.to(device), y.to(device)
+                    val_loss += criterion(model(x), y).item() * len(x)
+            val_loss /= len(val_loader.dataset)
+            print(f"Epoch {epoch:3d}/{C.MAX_EPOCHS}  Train: {train_loss:.4f}  Val: {val_loss:.4f}")
 
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    model.eval()
+            if val_loss < best_val_loss:
+                best_val_loss    = val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), ckpt_path)
+            else:
+                patience_counter += 1
+                if patience_counter >= C.PATIENCE:
+                    print(f"Early stopping at epoch {epoch}  (best val: {best_val_loss:.4f})")
+                    break
 
-    all_probs, all_true = [], []
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        model.eval()
+
+    # ── Evaluate: subject-level mean pooling ──────────────────────────────────
+    all_probs, all_true, all_subj_ids = [], [], []
     with torch.no_grad():
+        offset = 0
         for x, y in test_loader:
             probs = torch.softmax(model(x.to(device)), dim=1)[:, 1]
             all_probs.append(probs.cpu().numpy())
             all_true.append(y.numpy())
+            all_subj_ids.append(test_subj[offset:offset + len(x)])
+            offset += len(x)
 
-    metrics = compute_metrics(np.concatenate(all_true), np.concatenate(all_probs))
+    all_probs    = np.concatenate(all_probs)
+    all_true     = np.concatenate(all_true)
+    all_subj_ids = np.concatenate(all_subj_ids)
+
+    # Aggregate per subject — mean pool window probabilities
+    unique_test_subj = np.unique(all_subj_ids)
+    subj_probs = np.array([all_probs[all_subj_ids == s].mean() for s in unique_test_subj])
+    subj_true  = np.array([all_true [all_subj_ids == s][0]     for s in unique_test_subj])
+
+    print(f"Subject-level: {len(unique_test_subj)} subjects  "
+          f"HC={(subj_true==0).sum()}  PD={(subj_true==1).sum()}")
+
+    metrics = compute_metrics(subj_true, subj_probs)
     fold_metrics.append(metrics)
     print_fold_results(fold_idx, metrics)
 
     with open(RESULTS_FILE, 'w') as f:
         json.dump({'fold_metrics': fold_metrics,
-                   'folds_complete': fold_idx + 1}, f, indent=2)
+                   'folds_complete': fold_idx + 1,
+                   'evaluation': 'subject-level mean pooling'}, f, indent=2)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 agg = aggregate_fold_metrics(fold_metrics)
 print_summary(agg)
 
 with open(RESULTS_FILE, 'w') as f:
-    json.dump({'fold_metrics': fold_metrics, 'aggregate': agg}, f, indent=2)
+    json.dump({'fold_metrics': fold_metrics, 'aggregate': agg,
+               'evaluation': 'subject-level mean pooling'}, f, indent=2)
 
 print(f"\nResults:     {RESULTS_FILE}")
 print(f"Checkpoints: {C.CKPT_DIR}")
