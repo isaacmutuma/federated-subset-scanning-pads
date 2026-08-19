@@ -2,6 +2,7 @@
 train_boss_svm.py
 -----------------
 BOSS + SGD classifier for PADS IMU windows. Pure numpy — no pyts.
+Subject-level evaluation: mean pool per-window decision scores per subject.
 Run: python scripts/train_boss_svm.py
 """
 import sys, os, os.path as osp, json, warnings, zipfile
@@ -85,6 +86,8 @@ LABEL_MAP = {HC_STR: 0, PD_STR: 1}
 print(f'HC="{HC_STR}"  PD="{PD_STR}"')
 
 filtered = manifest[manifest['label'].isin([HC_STR, PD_STR])].copy()
+if C.TRAIN_WRIST is not None:
+    filtered = filtered[filtered['wrist'] == C.TRAIN_WRIST]
 print(f'Subjects: {filtered["patient_id"].nunique()}  Rows: {len(filtered)}')
 
 all_windows, all_labels_out, all_subject_ids = [], [], []
@@ -116,7 +119,7 @@ folds = generate_fold_splits(unique_subjects, subject_labels,
                               save_path=osp.join(C.OUTPUT_DIR, 'fold_splits.pkl'))
 
 # ── BOSS (pure numpy) ─────────────────────────────────────────────────────────
-BOSS_WINDOW_SIZES = [40]   # single window size for speed
+BOSS_WINDOW_SIZES = [40]
 BOSS_WORD_SIZE    = 4
 BOSS_N_BINS       = 4
 
@@ -130,10 +133,9 @@ def fit_boss_channel(X_ch, window_size, word_size, n_bins):
             sub = X_ch[i, start:start + window_size]
             dft = np.fft.rfft(sub)[:word_size]
             all_coeffs.append(np.real(dft))
-    all_coeffs = np.array(all_coeffs)
+    all_coeffs  = np.array(all_coeffs)
     breakpoints = np.percentile(all_coeffs,
-                                np.linspace(0, 100, n_bins + 1)[1:-1],
-                                axis=0)
+                                np.linspace(0, 100, n_bins + 1)[1:-1], axis=0)
     return breakpoints
 
 
@@ -145,9 +147,9 @@ def transform_boss_channel(X_ch, window_size, word_size, breakpoints):
         bag = Counter()
         prev_word = None
         for start in range(0, n_timesteps - window_size + 1, step):
-            sub = X_ch[i, start:start + window_size]
-            dft = np.fft.rfft(sub)[:word_size]
-            coeffs = np.real(dft)
+            sub     = X_ch[i, start:start + window_size]
+            dft     = np.fft.rfft(sub)[:word_size]
+            coeffs  = np.real(dft)
             letters = tuple(
                 int(np.searchsorted(breakpoints[:, j], coeffs[j], side='right'))
                 for j in range(word_size)
@@ -205,6 +207,7 @@ for fold_idx, fold in enumerate(folds):
 
     train_win, train_lab = windows[train_mask], labels[train_mask]
     test_win,  test_lab  = windows[test_mask],  labels[test_mask]
+    test_subj            = subject_ids[test_mask]
 
     mean, std = compute_normalization_stats(train_win)
     train_win = apply_normalization(train_win, mean, std)
@@ -218,7 +221,6 @@ for fold_idx, fold in enumerate(folds):
     train_win, train_lab = train_win[idx], train_lab[idx]
 
     print(f"Train: {train_win.shape[0]:,}  HC={(train_lab==0).sum():,}  PD={(train_lab==1).sum():,}")
-    print(f"Test:  {test_win.shape[0]:,}   HC={(test_lab==0).sum():,}   PD={(test_lab==1).sum():,}")
 
     print("Extracting BOSS features (train)...")
     X_train, fitted_params = extract_boss_features(
@@ -239,9 +241,19 @@ for fold_idx, fold in enumerate(folds):
     clf = SGDClassifier(loss='modified_huber', class_weight='balanced',
                         max_iter=1000, random_state=C.RANDOM_STATE, n_jobs=-1)
     clf.fit(X_train, train_lab)
-    scores  = clf.predict_proba(X_test)[:, 1]
 
-    metrics = compute_metrics(test_lab, scores)
+    # Per-window decision scores
+    window_scores = clf.predict_proba(X_test)[:, 1]
+
+    # ── Subject-level aggregation ─────────────────────────────────────────────
+    unique_test_subj = np.unique(test_subj)
+    subj_scores = np.array([window_scores[test_subj == s].mean() for s in unique_test_subj])
+    subj_true   = np.array([test_lab     [test_subj == s][0]     for s in unique_test_subj])
+
+    print(f"Subject-level: {len(unique_test_subj)} subjects  "
+          f"HC={(subj_true==0).sum()}  PD={(subj_true==1).sum()}")
+
+    metrics = compute_metrics(subj_true, subj_scores)
     fold_metrics.append(metrics)
     print_fold_results(fold_idx, metrics)
 
@@ -251,9 +263,8 @@ for fold_idx, fold in enumerate(folds):
 
 agg = aggregate_fold_metrics(fold_metrics)
 print_summary(agg)
-
 with open(RESULTS_FILE, 'w') as f:
-    json.dump({'fold_metrics': fold_metrics, 'aggregate': agg}, f, indent=2)
-
+    json.dump({'fold_metrics': fold_metrics, 'aggregate': agg,
+               'evaluation': 'subject-level mean pooling'}, f, indent=2)
 print(f"\nResults: {RESULTS_FILE}")
 print("DONE.")
