@@ -94,10 +94,9 @@ PD_STR = next(l for l in all_labels_found if 'parkinson' in l.lower() or l == 'P
 LABEL_MAP = {HC_STR: 0, PD_STR: 1}
 print(f'HC="{HC_STR}"  PD="{PD_STR}"')
 
-filtered = manifest[
-    manifest['label'].isin([HC_STR, PD_STR]) &
-    (manifest['wrist'] == C.TRAIN_WRIST)
-].copy()
+filtered = manifest[manifest['label'].isin([HC_STR, PD_STR])].copy()
+if C.TRAIN_WRIST is not None:
+    filtered = filtered[filtered['wrist'] == C.TRAIN_WRIST]
 print(f'Subjects: {filtered["patient_id"].nunique()}  Rows: {len(filtered)}')
 
 all_windows, all_labels_out, all_subject_ids = [], [], []
