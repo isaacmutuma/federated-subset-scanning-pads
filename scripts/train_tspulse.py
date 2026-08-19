@@ -3,7 +3,7 @@ train_tspulse.py
 ----------------
 TSPulse (IBM Granite) full fine-tuning for PADS IMU windows.
 Full backbone unfrozen — trains end-to-end with lower LR.
-Pretrained weights provide better initialisation than random.
+Subject-level evaluation: mean pool per-window probabilities per subject.
 
 Run:
     python scripts/train_tspulse.py
@@ -101,7 +101,11 @@ PD_STR = next(l for l in all_labels_found if 'parkinson' in l.lower() or l == 'P
 LABEL_MAP = {HC_STR: 0, PD_STR: 1}
 print(f'HC="{HC_STR}"  PD="{PD_STR}"')
 
-filtered = manifest[manifest['label'].isin([HC_STR, PD_STR])].copy()
+# RightWrist only — consistent with all other models
+filtered = manifest[
+    manifest['label'].isin([HC_STR, PD_STR]) &
+    (manifest['wrist'] == C.TRAIN_WRIST)
+].copy()
 print(f'Subjects: {filtered["patient_id"].nunique()}  Rows: {len(filtered)}')
 
 all_windows, all_labels_out, all_subject_ids = [], [], []
@@ -134,10 +138,6 @@ folds = generate_fold_splits(unique_subjects, subject_labels,
 
 # ── Dataset wrapper ───────────────────────────────────────────────────────────
 class TSPulseDataset(Dataset):
-    """
-    Pads windows from (6, 200) → (512, 6) for TSPulse.
-    TSPulse requires: (batch, seq_len=512, n_channels=6)
-    """
     def __init__(self, windows, labels):
         self.windows = torch.tensor(windows, dtype=torch.float32)
         self.labels  = torch.tensor(labels,  dtype=torch.long)
@@ -146,8 +146,8 @@ class TSPulseDataset(Dataset):
         return len(self.windows)
 
     def __getitem__(self, idx):
-        x = self.windows[idx].permute(1, 0)      # (200, 6)
-        x = F.pad(x, (0, 0, 0, 312))             # (512, 6)
+        x = self.windows[idx].permute(1, 0)   # (200, 6)
+        x = F.pad(x, (0, 0, 0, 312))          # (512, 6)
         return {'past_values': x, 'target_values': self.labels[idx]}
 
 
@@ -165,10 +165,9 @@ MODEL_CONFIG = {
     'num_targets': 2,
 }
 
-# ── Hyperparameters ───────────────────────────────────────────────────────────
 TS_PATIENCE   = 20
 TS_MAX_EPOCHS = 80
-TS_LR         = 5e-5    # lower LR — full fine-tuning of pretrained backbone
+TS_LR         = 5e-5
 TS_BATCH      = 32
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -187,6 +186,7 @@ for fold_idx, fold in enumerate(folds):
     train_win, train_lab = windows[train_mask], labels[train_mask]
     val_win,   val_lab   = windows[val_mask],   labels[val_mask]
     test_win,  test_lab  = windows[test_mask],  labels[test_mask]
+    test_subj            = subject_ids[test_mask]
 
     mean, std = compute_normalization_stats(train_win)
     train_win = apply_normalization(train_win, mean, std)
@@ -201,7 +201,7 @@ for fold_idx, fold in enumerate(folds):
     train_win, train_lab = train_win[idx], train_lab[idx]
 
     print(f"Train: {train_win.shape[0]:,}  HC={(train_lab==0).sum():,}  PD={(train_lab==1).sum():,}")
-    print(f"Val:   {val_win.shape[0]:,}    Test: {test_win.shape[0]:,}")
+    print(f"Val:   {val_win.shape[0]:,}    Test subjects: {len(np.unique(test_subj))}")
 
     train_loader = DataLoader(TSPulseDataset(train_win, train_lab),
                               batch_size=TS_BATCH, shuffle=True, drop_last=True)
@@ -210,7 +210,7 @@ for fold_idx, fold in enumerate(folds):
     test_loader  = DataLoader(TSPulseDataset(test_win,  test_lab),
                               batch_size=TS_BATCH, shuffle=False)
 
-    # Skip if checkpoint exists
+    # ── Skip if checkpoint exists ─────────────────────────────────────────────
     if osp.exists(ckpt_path):
         print(f"Checkpoint found — skipping training for fold {fold_idx+1}")
         model = TSPulseForClassification.from_pretrained(
@@ -222,14 +222,14 @@ for fold_idx, fold in enumerate(folds):
         model = model.to(device)
         model.eval()
     else:
-        # ── Full fine-tuning — all parameters trainable ───────────────────────
+        # ── Full fine-tuning ──────────────────────────────────────────────────
         model = TSPulseForClassification.from_pretrained(
             'ibm-granite/granite-timeseries-tspulse-r1',
             revision='tspulse-block-dualhead-512-p16-r1',
             **MODEL_CONFIG
         ).to(device)
 
-        # Unfreeze everything — pretrained weights are a better init than random
+        # Unfreeze all — pretrained weights provide better init than random
         for param in model.parameters():
             param.requires_grad = True
 
@@ -238,7 +238,6 @@ for fold_idx, fold in enumerate(folds):
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=TS_LR, weight_decay=1e-2)
 
-        # Linear warmup for 5 epochs, then cosine decay
         def lr_lambda(epoch):
             warmup = 5
             if epoch < warmup:
@@ -292,17 +291,31 @@ for fold_idx, fold in enumerate(folds):
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         model.eval()
 
-    # ── Evaluate ──────────────────────────────────────────────────────────────
-    all_probs, all_true = [], []
+    # ── Subject-level evaluation — mean pool window probabilities ─────────────
+    all_probs, all_true, all_subj_ids = [], [], []
     with torch.no_grad():
+        offset = 0
         for batch in test_loader:
             past_values = batch['past_values'].to(device)
             outputs     = model(past_values=past_values)
             probs       = torch.softmax(outputs.prediction_outputs, dim=1)[:, 1]
             all_probs.append(probs.cpu().numpy())
             all_true.append(batch['target_values'].numpy())
+            all_subj_ids.append(test_subj[offset:offset + len(past_values)])
+            offset += len(past_values)
 
-    metrics = compute_metrics(np.concatenate(all_true), np.concatenate(all_probs))
+    all_probs    = np.concatenate(all_probs)
+    all_true     = np.concatenate(all_true)
+    all_subj_ids = np.concatenate(all_subj_ids)
+
+    unique_test_subj = np.unique(all_subj_ids)
+    subj_probs = np.array([all_probs[all_subj_ids == s].mean() for s in unique_test_subj])
+    subj_true  = np.array([all_true [all_subj_ids == s][0]     for s in unique_test_subj])
+
+    print(f"Subject-level: {len(unique_test_subj)} subjects  "
+          f"HC={(subj_true==0).sum()}  PD={(subj_true==1).sum()}")
+
+    metrics = compute_metrics(subj_true, subj_probs)
     fold_metrics.append(metrics)
     print_fold_results(fold_idx, metrics)
 
@@ -315,7 +328,8 @@ agg = aggregate_fold_metrics(fold_metrics)
 print_summary(agg)
 
 with open(RESULTS_FILE, 'w') as f:
-    json.dump({'fold_metrics': fold_metrics, 'aggregate': agg}, f, indent=2)
+    json.dump({'fold_metrics': fold_metrics, 'aggregate': agg,
+               'evaluation': 'subject-level mean pooling'}, f, indent=2)
 
 print(f"\nResults:     {RESULTS_FILE}")
 print(f"Checkpoints: {C.CKPT_DIR}")
