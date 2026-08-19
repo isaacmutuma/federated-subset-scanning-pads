@@ -74,3 +74,5 @@ print(f"Config loaded — ENV={ENV}")
 print(f"  PADS root:   {PADS_ROOT}")
 print(f"  Checkpoints: {CKPT_DIR}")
 print(f"  Results:     {RESULTS_DIR}")
+
+TRAIN_WRIST = 'RightWrist'  # filter training data to right wrist only
