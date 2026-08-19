@@ -65,6 +65,7 @@ FS           = 100.0
 LOWCUT       = 1.0
 HIGHCUT      = 20.0
 ROCKET_KERNELS = 1000
+TRAIN_WRIST = None
 
 # ── Create directories ─────────────────────────────────────────────────────────
 for d in [OUTPUT_DIR, CKPT_DIR, RESULTS_DIR]:
@@ -74,5 +75,3 @@ print(f"Config loaded — ENV={ENV}")
 print(f"  PADS root:   {PADS_ROOT}")
 print(f"  Checkpoints: {CKPT_DIR}")
 print(f"  Results:     {RESULTS_DIR}")
-
-TRAIN_WRIST = 'RightWrist'  # filter training data to right wrist only
