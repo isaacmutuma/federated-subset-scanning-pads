@@ -3,17 +3,15 @@ extract_activations.py
 ----------------------
 Phase 4: Extract PatchTST encoder activations for DeepScan.
 
-For each fold:
-  - Load best PatchTST checkpoint
-  - Extract activations from HC train windows → background distribution
-  - Extract activations from all test windows (HC + PD) → test set
-  - Save to Drive as numpy arrays
-
-Output structure (per fold):
-  activations_fold{k}_hc_train.npy   — shape (n_hc_train_windows, d_model*6)
-  activations_fold{k}_test.npy       — shape (n_test_windows, d_model*6)
-  activations_fold{k}_test_labels.npy — shape (n_test_windows,) — 0=HC, 1=PD
-  activations_fold{k}_test_subj.npy  — shape (n_test_windows,) — subject IDs
+For each fold saves:
+  activations_fold{k}_hc_train.npy    — HC train background (n_hc_train, 768)
+  activations_fold{k}_val_pd.npy      — PD val activations for direction mask (n_pd_val, 768)
+  activations_fold{k}_val_hc.npy      — HC val activations (n_hc_val, 768)
+  activations_fold{k}_test.npy        — all test window activations (4260, 768)
+  activations_fold{k}_test_labels.npy — 0=HC 1=PD labels
+  activations_fold{k}_test_subj.npy   — subject IDs for aggregation
+  activations_fold{k}_norm_mean.npy   — normalisation mean
+  activations_fold{k}_norm_std.npy    — normalisation std
 
 Run:
     python scripts/extract_activations.py
@@ -48,15 +46,13 @@ from src.data.folds import generate_fold_splits
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {device}")
 
-os.makedirs(C.OUTPUT_DIR,  exist_ok=True)
-os.makedirs(C.CKPT_DIR,    exist_ok=True)
+os.makedirs(C.OUTPUT_DIR, exist_ok=True)
+os.makedirs(C.CKPT_DIR,   exist_ok=True)
 
-# Output dir for activations
 ACT_DIR = osp.join(C.RESULTS_DIR, 'activations')
 os.makedirs(ACT_DIR, exist_ok=True)
 print(f"Activations will be saved to: {ACT_DIR}")
 
-# ── Extract zip if needed ─────────────────────────────────────────────────────
 if C.PADS_ZIP and not osp.exists(C.PADS_ROOT):
     with zipfile.ZipFile(C.PADS_ZIP, 'r') as z:
         z.extractall(C.PADS_ROOT)
@@ -179,78 +175,102 @@ class PatchTSTClassifier(nn.Module):
         return self.classifier(pooled.reshape(pooled.size(0), -1))
 
     def get_activations(self, x):
-        """Returns pooled encoder representations — shape (batch, D_MODEL*6)"""
+        """Pooled encoder representation — shape (batch, D_MODEL*6=768)"""
         out    = self.encoder(past_values=x.permute(0, 2, 1))
         pooled = out.last_hidden_state.mean(dim=2)
         return pooled.reshape(pooled.size(0), -1).detach()
 
 
-# ── Extract activations per fold ──────────────────────────────────────────────
+def extract_acts(model, win_array, lab_array, batch_size=128):
+    """Run windows through encoder, return activation matrix."""
+    loader = DataLoader(PADSDataset(win_array, lab_array),
+                        batch_size=batch_size, shuffle=False)
+    acts = []
+    with torch.no_grad():
+        for x, _ in loader:
+            acts.append(model.get_activations(x.to(device)).cpu().numpy())
+    return np.concatenate(acts, axis=0)
+
+
+# ── Extract per fold ──────────────────────────────────────────────────────────
 for fold_idx, fold in enumerate(folds):
-    ckpt_path = osp.join(C.CKPT_DIR, f'patchtst_fold{fold_idx+1}_best.pt')
+    k = fold_idx + 1
+    ckpt_path = osp.join(C.CKPT_DIR, f'patchtst_fold{k}_best.pt')
     assert osp.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}"
 
-    print(f"\n{'='*55}\nFOLD {fold_idx+1}/{C.N_SPLITS}\n{'='*55}")
+    print(f"\n{'='*55}\nFOLD {k}/{C.N_SPLITS}\n{'='*55}")
 
-    # Skip if already extracted
-    hc_path = osp.join(ACT_DIR, f'activations_fold{fold_idx+1}_hc_train.npy')
-    if osp.exists(hc_path):
-        print(f"Already extracted — skipping fold {fold_idx+1}")
+    # Skip if all files already exist
+    files_needed = [
+        f'activations_fold{k}_hc_train.npy',
+        f'activations_fold{k}_val_pd.npy',
+        f'activations_fold{k}_test.npy',
+    ]
+    if all(osp.exists(osp.join(ACT_DIR, f)) for f in files_needed):
+        print(f"All files exist — skipping fold {k}")
         continue
 
     train_mask = np.isin(subject_ids, fold['train_subjects'])
+    val_mask   = np.isin(subject_ids, fold['val_subjects'])
     test_mask  = np.isin(subject_ids, fold['test_subjects'])
 
     train_win, train_lab = windows[train_mask], labels[train_mask]
+    val_win,   val_lab   = windows[val_mask],   labels[val_mask]
     test_win,  test_lab  = windows[test_mask],  labels[test_mask]
     test_subj            = subject_ids[test_mask]
 
     mean, std = compute_normalization_stats(train_win)
     train_win = apply_normalization(train_win, mean, std)
+    val_win   = apply_normalization(val_win,   mean, std)
     test_win  = apply_normalization(test_win,  mean, std)
 
-    # HC train windows only (background distribution for DeepScan)
-    hc_train_mask = train_lab == 0
-    hc_train_win  = train_win[hc_train_mask]
-    print(f"HC train windows: {hc_train_win.shape[0]:,}")
-    print(f"Test windows: {test_win.shape[0]:,}  HC={(test_lab==0).sum()}  PD={(test_lab==1).sum()}")
+    # Splits
+    hc_train_win = train_win[train_lab == 0]
+    val_hc_win   = val_win[val_lab == 0]
+    val_pd_win   = val_win[val_lab == 1]
+
+    print(f"HC train windows:  {hc_train_win.shape[0]:,}")
+    print(f"Val HC windows:    {val_hc_win.shape[0]:,}")
+    print(f"Val PD windows:    {val_pd_win.shape[0]:,}")
+    print(f"Test windows:      {test_win.shape[0]:,}  "
+          f"HC={(test_lab==0).sum()}  PD={(test_lab==1).sum()}")
 
     # Load model
     model = PatchTSTClassifier().to(device)
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
-    print(f"Loaded checkpoint: {ckpt_path}")
+    print(f"Loaded: {ckpt_path}")
 
-    # Extract HC train activations (background)
-    hc_loader = DataLoader(PADSDataset(hc_train_win,
-                                       np.zeros(len(hc_train_win), dtype=np.int64)),
-                           batch_size=128, shuffle=False)
-    hc_acts = []
-    with torch.no_grad():
-        for x, _ in hc_loader:
-            hc_acts.append(model.get_activations(x.to(device)).cpu().numpy())
-    hc_acts = np.concatenate(hc_acts, axis=0)
-    print(f"HC activations shape: {hc_acts.shape}")
+    # Extract activations
+    print("Extracting HC train activations...")
+    hc_train_acts = extract_acts(model, hc_train_win,
+                                  np.zeros(len(hc_train_win), dtype=np.int64))
 
-    # Extract test activations (all test windows — HC and PD)
-    test_loader = DataLoader(PADSDataset(test_win, test_lab),
-                             batch_size=128, shuffle=False)
-    test_acts = []
-    with torch.no_grad():
-        for x, _ in test_loader:
-            test_acts.append(model.get_activations(x.to(device)).cpu().numpy())
-    test_acts = np.concatenate(test_acts, axis=0)
-    print(f"Test activations shape: {test_acts.shape}")
+    print("Extracting val HC activations...")
+    val_hc_acts = extract_acts(model, val_hc_win,
+                                np.zeros(len(val_hc_win), dtype=np.int64))
+
+    print("Extracting val PD activations...")
+    val_pd_acts = extract_acts(model, val_pd_win,
+                                np.ones(len(val_pd_win), dtype=np.int64))
+
+    print("Extracting test activations...")
+    test_acts = extract_acts(model, test_win, test_lab)
+
+    print(f"Shapes — HC train: {hc_train_acts.shape}  "
+          f"Val HC: {val_hc_acts.shape}  Val PD: {val_pd_acts.shape}  "
+          f"Test: {test_acts.shape}")
 
     # Save
-    np.save(osp.join(ACT_DIR, f'activations_fold{fold_idx+1}_hc_train.npy'),   hc_acts)
-    np.save(osp.join(ACT_DIR, f'activations_fold{fold_idx+1}_test.npy'),        test_acts)
-    np.save(osp.join(ACT_DIR, f'activations_fold{fold_idx+1}_test_labels.npy'), test_lab)
-    np.save(osp.join(ACT_DIR, f'activations_fold{fold_idx+1}_test_subj.npy'),   test_subj)
-    np.save(osp.join(ACT_DIR, f'activations_fold{fold_idx+1}_norm_mean.npy'),   mean)
-    np.save(osp.join(ACT_DIR, f'activations_fold{fold_idx+1}_norm_std.npy'),    std)
-
-    print(f"Saved fold {fold_idx+1} activations to {ACT_DIR}")
+    np.save(osp.join(ACT_DIR, f'activations_fold{k}_hc_train.npy'),   hc_train_acts)
+    np.save(osp.join(ACT_DIR, f'activations_fold{k}_val_hc.npy'),      val_hc_acts)
+    np.save(osp.join(ACT_DIR, f'activations_fold{k}_val_pd.npy'),      val_pd_acts)
+    np.save(osp.join(ACT_DIR, f'activations_fold{k}_test.npy'),        test_acts)
+    np.save(osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy'), test_lab)
+    np.save(osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy'),   test_subj)
+    np.save(osp.join(ACT_DIR, f'activations_fold{k}_norm_mean.npy'),   mean)
+    np.save(osp.join(ACT_DIR, f'activations_fold{k}_norm_std.npy'),    std)
+    print(f"Saved fold {k} activations.")
 
 print("\nAll folds done.")
 print(f"Activations directory: {ACT_DIR}")

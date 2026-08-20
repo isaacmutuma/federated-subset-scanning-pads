@@ -3,23 +3,12 @@ run_deepscan.py
 ---------------
 Phase 4: Histogram-based anomaly scoring on PatchTST activations.
 
-Follows Celia Cintas / Akumu et al. pipeline:
-  [0] ART subsetscanning: github.com/Trusted-AI/adversarial-robustness-toolbox
-  [1] IBM personas repo:  github.com/IBM/personas-llms-analysis
-
 Method:
   1. Load HC train activations → build per-neuron histograms (100 bins)
-  2. Compute directed one-tailed p-values for each test window
-     - Direction mask: per neuron, use upper tail if PD > HC, lower tail otherwise
-     - Estimated from HC train mean vs per-neuron deviation direction
-  3. Anomaly score per window = 1 - mean(p-values across 768 neurons)
-  4. Subject-level mean pooling → AUC
-
-Note on FGSS scanner:
-  ART fgss_individ_for_nets was tested but underperforms simple mean p-value
-  on this data (fold 1: 0.580 vs 0.714). PD signal is diffuse across all 768
-  neurons rather than concentrated in a subset — simple aggregation is better.
-  Scanner results included in output for comparison.
+  2. Estimate direction mask from VAL PD activations (no test leakage)
+  3. Compute directed one-tailed p-values for each test window
+  4. Anomaly score = 1 - mean(p-values across 768 neurons) per window
+  5. Subject-level mean pooling → AUC
 
 Run:
     python scripts/run_deepscan.py
@@ -46,7 +35,6 @@ os.chdir(C.REPO_DIR)
 from src.training.metrics import (compute_metrics, aggregate_fold_metrics,
                                    print_fold_results, print_summary)
 
-# ── Install ART if needed ─────────────────────────────────────────────────────
 try:
     from art.defences.detector.evasion.subsetscanning.scanner import Scanner
     from art.defences.detector.evasion.subsetscanning.scoring_functions import ScoringFunctions
@@ -59,31 +47,27 @@ except ImportError:
         from art.defences.detector.evasion.subsetscanning.scanner import Scanner
         from art.defences.detector.evasion.subsetscanning.scoring_functions import ScoringFunctions
         ART_AVAILABLE = True
-        print("ART subsetscanning loaded.")
     except Exception:
         ART_AVAILABLE = False
-        print("ART not available — running without FGSS scanner.")
+        print("ART not available — skipping FGSS scanner.")
 
 ACT_DIR = osp.join(C.RESULTS_DIR, 'activations')
 assert osp.exists(ACT_DIR), f"Run extract_activations.py first. Not found: {ACT_DIR}"
 os.makedirs(C.RESULTS_DIR, exist_ok=True)
 
-N_BINS = 100   # histogram bins per neuron
-A_MAX  = 0.5   # alpha threshold for FGSS scanner
+N_BINS = 100
+A_MAX  = 0.5
 
 
-# ── Histogram p-value computation ─────────────────────────────────────────────
 def compute_pvalues_directed(hc_acts, test_acts, direction_mask, n_bins=N_BINS):
     """
-    Build per-neuron histograms from HC background activations.
-    Compute directed one-tailed p-values for test windows.
+    Per neuron:
+      - Build histogram from HC train activations
+      - Compute one-tailed p-value for each test window
+        Upper tail if direction_mask[j]=True (PD > HC for this neuron)
+        Lower tail if direction_mask[j]=False (PD < HC for this neuron)
 
-    direction_mask: bool array (n_neurons,)
-      True  → use upper tail (PD expected higher than HC for this neuron)
-      False → use lower tail (PD expected lower than HC for this neuron)
-
-    Returns p_matrix: shape (n_test, n_neurons)
-    Low p-value = activation unlikely under HC distribution (anomalous)
+    Returns p_matrix: (n_test, n_neurons) — low p = anomalous
     """
     n_test, n_neurons = test_acts.shape
     p_matrix = np.zeros((n_test, n_neurons), dtype=np.float64)
@@ -95,147 +79,119 @@ def compute_pvalues_directed(hc_acts, test_acts, direction_mask, n_bins=N_BINS):
         counts, edges = np.histogram(hc_col, bins=n_bins, density=False)
         counts  = counts.astype(float) + 1e-6   # Laplace smoothing
         probs   = counts / counts.sum()
-        cum     = np.cumsum(probs)               # empirical CDF
+        cum     = np.cumsum(probs)
 
         bin_idx   = np.searchsorted(edges[1:], test_col, side='right')
         bin_idx   = np.clip(bin_idx, 0, len(probs) - 1)
         lower_cum = np.where(bin_idx > 0, cum[bin_idx - 1], 0.0)
 
         if direction_mask[j]:
-            # Upper tail: P(X >= x | HC)
             p_matrix[:, j] = np.clip(1.0 - lower_cum, 1e-6, 1.0)
         else:
-            # Lower tail: P(X <= x | HC)
             p_matrix[:, j] = np.clip(lower_cum + probs[bin_idx], 1e-6, 1.0)
 
     return p_matrix
 
 
-# ── Safe FGSS scorer ─────────────────────────────────────────────────────────
 def fgss_score_window(pvals, a_max=A_MAX, score_fn=None):
-    """Score one window with ART FGSS. Returns 0 if no subset found."""
     try:
         score, _, _, _ = Scanner.fgss_individ_for_nets(
             pvalues=pvals.reshape(1, -1).astype(np.float64),
-            a_max=a_max,
-            score_function=score_fn,
-        )
+            a_max=a_max, score_function=score_fn)
         return float(score)
     except (ValueError, Exception):
         return 0.0
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
 RESULTS_FILE = osp.join(C.RESULTS_DIR, 'deepscan_results.json')
-fold_metrics_mean  = []   # primary: simple mean p-value
-fold_metrics_fgss  = []   # secondary: FGSS scanner (if ART available)
+fold_metrics_mean = []
+fold_metrics_fgss = []
 
 for fold_idx in range(C.N_SPLITS):
     k = fold_idx + 1
     print(f"\n{'='*55}\nFOLD {k}/{C.N_SPLITS}\n{'='*55}")
 
     hc_acts   = np.load(osp.join(ACT_DIR, f'activations_fold{k}_hc_train.npy'))
+    val_pd    = np.load(osp.join(ACT_DIR, f'activations_fold{k}_val_pd.npy'))
     test_acts = np.load(osp.join(ACT_DIR, f'activations_fold{k}_test.npy'))
     test_lab  = np.load(osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy'))
     test_subj = np.load(osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy'))
 
     print(f"HC background: {hc_acts.shape}")
+    print(f"Val PD (direction mask): {val_pd.shape}")
     print(f"Test: {test_acts.shape}  HC={(test_lab==0).sum()}  PD={(test_lab==1).sum()}")
 
-    # Direction mask: per neuron, which tail is anomalous for PD?
-    # Built from HC train mean — no test label leakage for the mask itself
+    # Direction mask — estimated from VAL PD, not test (no leakage)
     hc_train_mean  = hc_acts.mean(0)
-    pd_test_mean   = test_acts[test_lab == 1].mean(0)   # note: uses test PD mean
-    direction_mask = pd_test_mean > hc_train_mean        # True = upper tail
+    val_pd_mean    = val_pd.mean(0)
+    direction_mask = val_pd_mean > hc_train_mean
     print(f"Direction: {direction_mask.sum()} upper-tail  "
           f"{(~direction_mask).sum()} lower-tail neurons")
 
-    # Step 1 — Compute directed p-value matrix
+    # P-value matrix
     print("Computing directed p-values...")
     p_matrix = compute_pvalues_directed(hc_acts, test_acts, direction_mask, N_BINS)
-    print(f"P-matrix: {p_matrix.shape}")
     print(f"  HC p-value mean: {p_matrix[test_lab==0].mean():.4f}")
     print(f"  PD p-value mean: {p_matrix[test_lab==1].mean():.4f}")
 
-    # ── Primary method: simple mean p-value ───────────────────────────────────
-    # Anomaly score = 1 - mean(p-values) → higher = more anomalous
-    window_scores_mean = 1.0 - p_matrix.mean(axis=1)
+    # ── Primary: simple mean p-value ─────────────────────────────────────────
+    window_scores = 1.0 - p_matrix.mean(axis=1)
 
-    unique_subj  = np.unique(test_subj)
-    subj_scores  = np.array([window_scores_mean[test_subj==s].mean() for s in unique_subj])
-    subj_true    = np.array([test_lab[test_subj==s][0] for s in unique_subj])
+    unique_subj = np.unique(test_subj)
+    subj_scores = np.array([window_scores[test_subj==s].mean() for s in unique_subj])
+    subj_true   = np.array([test_lab[test_subj==s][0] for s in unique_subj])
 
-    print(f"Subject-level [{len(unique_subj)} subjects]: "
+    print(f"Subject-level: {len(unique_subj)} subjects  "
           f"HC={(subj_true==0).sum()}  PD={(subj_true==1).sum()}")
 
     metrics_mean = compute_metrics(subj_true, subj_scores)
     fold_metrics_mean.append(metrics_mean)
-    print(f"Mean p-value method — ", end="")
+    print("Mean p-value — ", end="")
     print_fold_results(fold_idx, metrics_mean)
 
-    # ── Secondary method: ART FGSS scanner ───────────────────────────────────
+    # ── Secondary: ART FGSS scanner ──────────────────────────────────────────
     if ART_AVAILABLE:
-        print("Running ART fgss_individ_for_nets per window...")
+        print("Running ART fgss_individ_for_nets...")
         score_fn = ScoringFunctions.get_score_bj_fast
         window_scores_fgss = np.array([
             fgss_score_window(p_matrix[i], a_max=A_MAX, score_fn=score_fn)
             for i in range(len(p_matrix))
         ])
-        print(f"  HC scores: mean={window_scores_fgss[test_lab==0].mean():.4f}  "
-              f"zeros={(window_scores_fgss[test_lab==0]==0).mean():.2f}")
-        print(f"  PD scores: mean={window_scores_fgss[test_lab==1].mean():.4f}  "
-              f"zeros={(window_scores_fgss[test_lab==1]==0).mean():.2f}")
-
         subj_fgss    = np.array([window_scores_fgss[test_subj==s].mean() for s in unique_subj])
         metrics_fgss = compute_metrics(subj_true, subj_fgss)
         fold_metrics_fgss.append(metrics_fgss)
-        print(f"FGSS scanner method — ", end="")
+        print("FGSS scanner — ", end="")
         print_fold_results(fold_idx, metrics_fgss)
 
-    # Save intermediate results
     with open(RESULTS_FILE, 'w') as f:
-        json.dump({
-            'fold_metrics_mean_pvalue': fold_metrics_mean,
-            'fold_metrics_fgss':        fold_metrics_fgss if ART_AVAILABLE else [],
-            'folds_complete':            k,
-            'method':                   'Directed histogram p-values (100 bins)',
-            'n_bins':                   N_BINS,
-            'n_neurons':                hc_acts.shape[1],
-            'a_max':                    A_MAX,
-        }, f, indent=2)
+        json.dump({'fold_metrics_mean_pvalue': fold_metrics_mean,
+                   'fold_metrics_fgss':        fold_metrics_fgss,
+                   'folds_complete':            k,
+                   'direction_source':          'val_pd (no test leakage)',
+                   'n_bins': N_BINS, 'a_max': A_MAX}, f, indent=2)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n{'='*55}")
-print("PRIMARY METHOD: Simple mean p-value (1 - mean p across neurons)")
-print('='*55)
+print("PRIMARY: Simple mean p-value")
 agg_mean = aggregate_fold_metrics(fold_metrics_mean)
 print_summary(agg_mean)
 
 if ART_AVAILABLE and fold_metrics_fgss:
     print(f"\n{'='*55}")
-    print("SECONDARY METHOD: ART FGSS Berk-Jones scanner")
-    print('='*55)
+    print("SECONDARY: ART FGSS Berk-Jones")
     agg_fgss = aggregate_fold_metrics(fold_metrics_fgss)
     print_summary(agg_fgss)
 else:
     agg_fgss = {}
 
 with open(RESULTS_FILE, 'w') as f:
-    json.dump({
-        'fold_metrics_mean_pvalue': fold_metrics_mean,
-        'aggregate_mean_pvalue':    agg_mean,
-        'fold_metrics_fgss':        fold_metrics_fgss if ART_AVAILABLE else [],
-        'aggregate_fgss':           agg_fgss,
-        'evaluation':               'subject-level mean pooling',
-        'method':                   'Directed histogram p-values (100 bins, Laplace smoothing)',
-        'n_bins':                   N_BINS,
-        'a_max':                    A_MAX,
-        'finding': (
-            'Simple mean p-value (0.730 AUC) outperforms FGSS scanner on this data. '
-            'PD signal is diffuse across all 768 neurons — not concentrated in a subset. '
-            'Histogram-based anomaly detection without PD labels at inference.'
-        ),
-    }, f, indent=2)
+    json.dump({'fold_metrics_mean_pvalue': fold_metrics_mean,
+               'aggregate_mean_pvalue':    agg_mean,
+               'fold_metrics_fgss':        fold_metrics_fgss,
+               'aggregate_fgss':           agg_fgss,
+               'evaluation':               'subject-level mean pooling',
+               'direction_source':         'val_pd (no test leakage)',
+               'n_bins': N_BINS, 'a_max': A_MAX}, f, indent=2)
 
 print(f"\nResults: {RESULTS_FILE}")
 print("DONE.")
