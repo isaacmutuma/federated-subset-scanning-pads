@@ -12,6 +12,7 @@ Environments:
 
 import os
 
+
 # ── Set your environment here ─────────────────────────────────────────────────
 ENV = 'colab'   # options: 'colab', 'kaggle', 'local'
 # ─────────────────────────────────────────────────────────────────────────────
@@ -21,8 +22,8 @@ if ENV == 'colab':
     PADS_ROOT    = '/content/pads_dataset'          # extracted zip goes here
     PADS_ZIP     = '/content/drive/MyDrive/pads-parkisons-dataset-folder/pads-parkinsons-disease-smartwatch-dataset-1.0.0.zip'
     OUTPUT_DIR   = '/content/processed'             # windows.npy etc.
-    CKPT_DIR     = '/content/drive/MyDrive/patchtst_checkpoints'   # survives disconnects
-    RESULTS_DIR  = '/content/drive/MyDrive/patchtst_checkpoints'   # same folder
+    CKPT_DIR    = os.path.join('/content/drive/MyDrive', 'patchtst_checkpoints_nw5')
+    RESULTS_DIR = os.path.join('/content/drive/MyDrive', 'patchtst_checkpoints_nw5')   # same folder
 
 elif ENV == 'kaggle':
     REPO_DIR     = '/kaggle/working/federated-subset-scanning-pads'
@@ -60,7 +61,7 @@ MAX_EPOCHS   = 100
 N_SPLITS     = 5
 RANDOM_STATE = 42
 WINDOW_SIZE  = 200
-N_WINDOWS    = 10
+N_WINDOWS    = 5
 FS           = 100.0
 LOWCUT       = 1.0
 HIGHCUT      = 20.0
