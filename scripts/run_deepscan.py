@@ -1,14 +1,17 @@
 """
 run_deepscan.py
 ---------------
-Phase 4: Histogram-based anomaly scoring on PatchTST activations.
+Phase 4: Histogram-based subset scanning on PatchTST activations.
 
-Method:
-  1. Load HC train activations → build per-neuron histograms (100 bins)
-  2. Estimate direction mask from VAL PD activations (no test leakage)
-  3. Compute directed one-tailed p-values for each test window
-  4. Anomaly score = 1 - mean(p-values across 768 neurons) per window
-  5. Subject-level mean pooling → AUC
+Three methods compared:
+  A) Simple mean p-value (1 - mean p across neurons, per window, then average per subject)
+  B) Per-window FGSS (fgss_individ_for_nets per window, then average per subject)
+  C) Group FGSS (fgss_for_nets on ALL windows from one subject simultaneously)
+     → finds joint anomalous subset of (windows × neurons) — the SubsetGAN approach
+
+Method C follows Cintas et al. SubsetGAN (2021):
+  "identify abnormal patterns across a GROUP of images"
+  Returns image_sub (anomalous windows) + node_sub (anomalous neurons) + best_score
 
 Run:
     python scripts/run_deepscan.py
@@ -49,51 +52,37 @@ except ImportError:
         ART_AVAILABLE = True
     except Exception:
         ART_AVAILABLE = False
-        print("ART not available — skipping FGSS scanner.")
+        print("ART not available.")
 
 ACT_DIR = osp.join(C.RESULTS_DIR, 'activations')
 assert osp.exists(ACT_DIR), f"Run extract_activations.py first. Not found: {ACT_DIR}"
 os.makedirs(C.RESULTS_DIR, exist_ok=True)
 
-N_BINS = 100
-A_MAX  = 0.5
+N_BINS   = 100
+A_MAX    = 0.5
+RESTARTS = 10   # iterative restarts for group scan
 
 
+# ── Histogram p-value computation ─────────────────────────────────────────────
 def compute_pvalues_directed(hc_acts, test_acts, direction_mask, n_bins=N_BINS):
-    """
-    Per neuron:
-      - Build histogram from HC train activations
-      - Compute one-tailed p-value for each test window
-        Upper tail if direction_mask[j]=True (PD > HC for this neuron)
-        Lower tail if direction_mask[j]=False (PD < HC for this neuron)
-
-    Returns p_matrix: (n_test, n_neurons) — low p = anomalous
-    """
     n_test, n_neurons = test_acts.shape
     p_matrix = np.zeros((n_test, n_neurons), dtype=np.float64)
-
     for j in range(n_neurons):
-        hc_col   = hc_acts[:, j]
-        test_col = test_acts[:, j]
-
-        counts, edges = np.histogram(hc_col, bins=n_bins, density=False)
-        counts  = counts.astype(float) + 1e-6   # Laplace smoothing
+        counts, edges = np.histogram(hc_acts[:, j], bins=n_bins, density=False)
+        counts  = counts.astype(float) + 1e-6
         probs   = counts / counts.sum()
         cum     = np.cumsum(probs)
-
-        bin_idx   = np.searchsorted(edges[1:], test_col, side='right')
-        bin_idx   = np.clip(bin_idx, 0, len(probs) - 1)
-        lower_cum = np.where(bin_idx > 0, cum[bin_idx - 1], 0.0)
-
+        bin_idx = np.clip(np.searchsorted(edges[1:], test_acts[:, j], side='right'),
+                          0, len(probs) - 1)
+        lower   = np.where(bin_idx > 0, cum[bin_idx - 1], 0.0)
         if direction_mask[j]:
-            p_matrix[:, j] = np.clip(1.0 - lower_cum, 1e-6, 1.0)
+            p_matrix[:, j] = np.clip(1.0 - lower, 1e-6, 1.0)
         else:
-            p_matrix[:, j] = np.clip(lower_cum + probs[bin_idx], 1e-6, 1.0)
-
+            p_matrix[:, j] = np.clip(lower + probs[bin_idx], 1e-6, 1.0)
     return p_matrix
 
 
-def fgss_score_window(pvals, a_max=A_MAX, score_fn=None):
+def safe_individ_score(pvals, a_max=A_MAX, score_fn=None):
     try:
         score, _, _, _ = Scanner.fgss_individ_for_nets(
             pvalues=pvals.reshape(1, -1).astype(np.float64),
@@ -103,9 +92,28 @@ def fgss_score_window(pvals, a_max=A_MAX, score_fn=None):
         return 0.0
 
 
+def safe_group_score(p_subj, a_max=A_MAX, restarts=RESTARTS, score_fn=None):
+    """
+    Group scan: p_subj shape (n_windows_for_subject, n_neurons)
+    Returns best_score — the joint anomaly score for this subject.
+    """
+    try:
+        best_score, image_sub, node_sub, optimal_alpha = Scanner.fgss_for_nets(
+            pvalues=p_subj.astype(np.float64),
+            a_max=a_max,
+            restarts=restarts,
+            score_function=score_fn,
+        )
+        return float(best_score), len(image_sub), len(node_sub)
+    except (ValueError, Exception):
+        return 0.0, 0, 0
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
 RESULTS_FILE = osp.join(C.RESULTS_DIR, 'deepscan_results.json')
-fold_metrics_mean = []
-fold_metrics_fgss = []
+fold_metrics_mean   = []
+fold_metrics_individ = []
+fold_metrics_group  = []
 
 for fold_idx in range(C.N_SPLITS):
     k = fold_idx + 1
@@ -117,81 +125,106 @@ for fold_idx in range(C.N_SPLITS):
     test_lab  = np.load(osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy'))
     test_subj = np.load(osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy'))
 
-    print(f"HC background: {hc_acts.shape}")
-    print(f"Val PD (direction mask): {val_pd.shape}")
+    print(f"HC background: {hc_acts.shape}  Val PD: {val_pd.shape}")
     print(f"Test: {test_acts.shape}  HC={(test_lab==0).sum()}  PD={(test_lab==1).sum()}")
 
-    # Direction mask — estimated from VAL PD, not test (no leakage)
-    hc_train_mean  = hc_acts.mean(0)
-    val_pd_mean    = val_pd.mean(0)
-    direction_mask = val_pd_mean > hc_train_mean
-    print(f"Direction: {direction_mask.sum()} upper-tail  "
-          f"{(~direction_mask).sum()} lower-tail neurons")
+    # Direction mask from val PD (no test leakage)
+    direction_mask = val_pd.mean(0) > hc_acts.mean(0)
+    print(f"Direction: {direction_mask.sum()} upper  {(~direction_mask).sum()} lower")
 
     # P-value matrix
     print("Computing directed p-values...")
     p_matrix = compute_pvalues_directed(hc_acts, test_acts, direction_mask, N_BINS)
-    print(f"  HC p-value mean: {p_matrix[test_lab==0].mean():.4f}")
-    print(f"  PD p-value mean: {p_matrix[test_lab==1].mean():.4f}")
-
-    # ── Primary: simple mean p-value ─────────────────────────────────────────
-    window_scores = 1.0 - p_matrix.mean(axis=1)
+    print(f"  HC p mean: {p_matrix[test_lab==0].mean():.4f}  "
+          f"PD p mean: {p_matrix[test_lab==1].mean():.4f}")
 
     unique_subj = np.unique(test_subj)
-    subj_scores = np.array([window_scores[test_subj==s].mean() for s in unique_subj])
     subj_true   = np.array([test_lab[test_subj==s][0] for s in unique_subj])
 
-    print(f"Subject-level: {len(unique_subj)} subjects  "
-          f"HC={(subj_true==0).sum()}  PD={(subj_true==1).sum()}")
-
-    metrics_mean = compute_metrics(subj_true, subj_scores)
+    # ── Method A: simple mean p-value ─────────────────────────────────────────
+    win_scores_mean = 1.0 - p_matrix.mean(axis=1)
+    subj_mean = np.array([win_scores_mean[test_subj==s].mean() for s in unique_subj])
+    metrics_mean = compute_metrics(subj_true, subj_mean)
     fold_metrics_mean.append(metrics_mean)
-    print("Mean p-value — ", end="")
+    print(f"A) Mean p-value — ", end="")
     print_fold_results(fold_idx, metrics_mean)
 
-    # ── Secondary: ART FGSS scanner ──────────────────────────────────────────
     if ART_AVAILABLE:
-        print("Running ART fgss_individ_for_nets...")
         score_fn = ScoringFunctions.get_score_bj_fast
-        window_scores_fgss = np.array([
-            fgss_score_window(p_matrix[i], a_max=A_MAX, score_fn=score_fn)
+
+        # ── Method B: per-window FGSS then average ────────────────────────────
+        print("B) Running per-window fgss_individ_for_nets...")
+        win_scores_individ = np.array([
+            safe_individ_score(p_matrix[i], a_max=A_MAX, score_fn=score_fn)
             for i in range(len(p_matrix))
         ])
-        subj_fgss    = np.array([window_scores_fgss[test_subj==s].mean() for s in unique_subj])
-        metrics_fgss = compute_metrics(subj_true, subj_fgss)
-        fold_metrics_fgss.append(metrics_fgss)
-        print("FGSS scanner — ", end="")
-        print_fold_results(fold_idx, metrics_fgss)
+        subj_individ = np.array([win_scores_individ[test_subj==s].mean()
+                                  for s in unique_subj])
+        metrics_individ = compute_metrics(subj_true, subj_individ)
+        fold_metrics_individ.append(metrics_individ)
+        print(f"B) Per-window FGSS — ", end="")
+        print_fold_results(fold_idx, metrics_individ)
 
+        # ── Method C: group FGSS per subject (SubsetGAN approach) ─────────────
+        print("C) Running group fgss_for_nets per subject...")
+        subj_group_scores = []
+        for s_idx, s in enumerate(unique_subj):
+            mask    = test_subj == s
+            p_subj  = p_matrix[mask]   # shape (n_windows_for_s, 768)
+            score, n_img, n_node = safe_group_score(
+                p_subj, a_max=A_MAX, restarts=RESTARTS, score_fn=score_fn)
+            subj_group_scores.append(score)
+            if s_idx % 10 == 0:
+                label = "PD" if subj_true[s_idx] == 1 else "HC"
+                print(f"  Subject {s} ({label}): score={score:.4f}  "
+                      f"anomalous_windows={n_img}/{mask.sum()}  nodes={n_node}")
+
+        subj_group = np.array(subj_group_scores)
+        metrics_group = compute_metrics(subj_true, subj_group)
+        fold_metrics_group.append(metrics_group)
+        print(f"C) Group FGSS — ", end="")
+        print_fold_results(fold_idx, metrics_group)
+
+    # Save
     with open(RESULTS_FILE, 'w') as f:
-        json.dump({'fold_metrics_mean_pvalue': fold_metrics_mean,
-                   'fold_metrics_fgss':        fold_metrics_fgss,
-                   'folds_complete':            k,
-                   'direction_source':          'val_pd (no test leakage)',
-                   'n_bins': N_BINS, 'a_max': A_MAX}, f, indent=2)
+        json.dump({'fold_metrics_mean':    fold_metrics_mean,
+                   'fold_metrics_individ': fold_metrics_individ,
+                   'fold_metrics_group':   fold_metrics_group,
+                   'folds_complete': k,
+                   'direction_source': 'val_pd',
+                   'n_bins': N_BINS, 'a_max': A_MAX,
+                   'restarts': RESTARTS}, f, indent=2)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n{'='*55}")
-print("PRIMARY: Simple mean p-value")
+print("A) Simple mean p-value")
 agg_mean = aggregate_fold_metrics(fold_metrics_mean)
 print_summary(agg_mean)
 
-if ART_AVAILABLE and fold_metrics_fgss:
+if ART_AVAILABLE:
     print(f"\n{'='*55}")
-    print("SECONDARY: ART FGSS Berk-Jones")
-    agg_fgss = aggregate_fold_metrics(fold_metrics_fgss)
-    print_summary(agg_fgss)
+    print("B) Per-window FGSS (individ), averaged per subject")
+    agg_individ = aggregate_fold_metrics(fold_metrics_individ)
+    print_summary(agg_individ)
+
+    print(f"\n{'='*55}")
+    print("C) Group FGSS per subject (SubsetGAN approach)")
+    agg_group = aggregate_fold_metrics(fold_metrics_group)
+    print_summary(agg_group)
 else:
-    agg_fgss = {}
+    agg_individ = {}
+    agg_group   = {}
 
 with open(RESULTS_FILE, 'w') as f:
-    json.dump({'fold_metrics_mean_pvalue': fold_metrics_mean,
-               'aggregate_mean_pvalue':    agg_mean,
-               'fold_metrics_fgss':        fold_metrics_fgss,
-               'aggregate_fgss':           agg_fgss,
-               'evaluation':               'subject-level mean pooling',
-               'direction_source':         'val_pd (no test leakage)',
-               'n_bins': N_BINS, 'a_max': A_MAX}, f, indent=2)
+    json.dump({'fold_metrics_mean':    fold_metrics_mean,
+               'aggregate_mean':       agg_mean,
+               'fold_metrics_individ': fold_metrics_individ,
+               'aggregate_individ':    agg_individ,
+               'fold_metrics_group':   fold_metrics_group,
+               'aggregate_group':      agg_group,
+               'evaluation':           'subject-level',
+               'direction_source':     'val_pd (no test leakage)',
+               'n_bins': N_BINS, 'a_max': A_MAX, 'restarts': RESTARTS}, f, indent=2)
 
 print(f"\nResults: {RESULTS_FILE}")
 print("DONE.")
