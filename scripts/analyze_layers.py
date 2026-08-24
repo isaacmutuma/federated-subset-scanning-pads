@@ -2,18 +2,16 @@
 analyze_layers.py
 -----------------
 Layer analysis for PatchTST — adapted from Celia Cintas's representation_extraction.ipynb.
+Evaluates at SUBJECT level (mean-pool all windows per subject).
 
-Steps (matching her notebook):
-  1. Extract hidden states at each transformer block end (embedding + layers 0,1,2)
-  2. PCA visualization — HC (negative) vs PD (positive) per layer
-  3. Classifier per layer — 5-fold CV logistic regression to rank layers by AUC
-  4. Save per-layer activations as .npy for DeepScan experiments
+Steps:
+  1. Extract hidden states at each transformer block (embedding, layers 0-2)
+  2. Aggregate per subject — mean over all windows (110 per subject)
+  3. PCA visualization — HC vs PD per layer at subject level
+  4. Classifier per layer — 5-fold CV logistic regression, subject-level AUC
+  5. Save per-layer activations as .npy for DeepScan
 
-Token strategy: mean over all patches and channels → (128-dim) per window
-  — matches strategy C which gave best silhouette in previous analysis
-
-Run:
-    python scripts/analyze_layers.py
+Token strategy: mean over all channels and patches → 128-dim per window
 """
 
 import sys, os, os.path as osp, json, warnings, pickle
@@ -67,16 +65,7 @@ test_subj          = subject_ids[test_mask]
 
 mean, std = compute_normalization_stats(train_win)
 test_win  = apply_normalization(test_win, mean, std)
-print(f"Test: {test_win.shape}  HC={(test_lab==0).sum()}  PD={(test_lab==1).sum()}")
-
-# Subsample 300 HC + 300 PD for visualization (use all for classifier)
-np.random.seed(42)
-hc_idx  = np.where(test_lab==0)[0]
-pd_idx  = np.where(test_lab==1)[0]
-sub_idx = np.concatenate([
-    np.random.choice(hc_idx, min(300, len(hc_idx)), replace=False),
-    np.random.choice(pd_idx, min(300, len(pd_idx)), replace=False)
-])
+print(f"Test windows: {test_win.shape}  HC={(test_lab==0).sum()}  PD={(test_lab==1).sum()}")
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 config = PatchTSTConfig(
@@ -122,9 +111,8 @@ model.encoder.encoder.layers[0].register_forward_hook(make_hook('layer_0'))
 model.encoder.encoder.layers[1].register_forward_hook(make_hook('layer_1'))
 model.encoder.encoder.layers[2].register_forward_hook(make_hook('layer_2'))
 
-
-def extract_layer_acts(win_array, lab_array, batch_size=32):
-    """Run forward pass, collect all layer activations. Returns dict of (n, 128) arrays."""
+def extract_window_acts(win_array, lab_array, batch_size=32):
+    """Extract 128-dim activations per window for all layers."""
     loader = DataLoader(PADSDataset(win_array, lab_array),
                         batch_size=batch_size, shuffle=False)
     collected = {n: [] for n in LAYER_NAMES}
@@ -136,25 +124,25 @@ def extract_layer_acts(win_array, lab_array, batch_size=32):
                 collected[name].append(hook_outputs[name].numpy().mean(axis=(1, 2)))
     return {n: np.concatenate(v, axis=0) for n, v in collected.items()}
 
+# ── Extract window-level, then aggregate to subject level ─────────────────────
+print("\nExtracting window activations for all test windows...")
+win_acts = extract_window_acts(test_win, test_lab)
+print(f"Shape per layer: {next(iter(win_acts.values())).shape}")
 
-# ── Step 1: Extract activations ───────────────────────────────────────────────
-print("\nExtracting activations for subsample (visualization)...")
-sub_acts  = extract_layer_acts(test_win[sub_idx], test_lab[sub_idx])
-sub_labels = test_lab[sub_idx]
+# Aggregate per subject: mean over all windows belonging to a subject
+unique_subj  = np.unique(test_subj)
+subj_labels  = np.array([test_lab[test_subj==s][0] for s in unique_subj])
+print(f"\nSubjects: {len(unique_subj)}  HC={(subj_labels==0).sum()}  PD={(subj_labels==1).sum()}")
+print(f"Windows per subject: {[(test_subj==s).sum() for s in unique_subj[:5]]}")
 
-print("Extracting activations for full test set (classifier)...")
-full_acts  = extract_layer_acts(test_win, test_lab)
-full_labels = test_lab
-full_subj   = test_subj
+subj_acts = {}
+for layer in LAYER_NAMES:
+    subj_acts[layer] = np.array([
+        win_acts[layer][test_subj==s].mean(axis=0) for s in unique_subj
+    ])  # shape: (71, 128)
+    print(f"  {layer} subject features: {subj_acts[layer].shape}")
 
-print(f"Shape per layer: {next(iter(full_acts.values())).shape}")
-
-# ── Step 2: PCA visualization — HC vs PD per layer ───────────────────────────
-# Matches Celia's generate_PCA_directions
-fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-fig.suptitle('PCA — HC vs PD across PatchTST layers (300 HC + 300 PD windows)',
-             fontsize=11, fontweight='500')
-
+# ── PCA visualization — subject level ─────────────────────────────────────────
 LAYER_DISPLAY = {
     'embedding': 'Patch Embedding',
     'layer_0':   'Transformer Layer 0',
@@ -163,53 +151,55 @@ LAYER_DISPLAY = {
 }
 colors = {0: '#1baf7a', 1: '#e05c3a'}
 
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+fig.suptitle('PCA — HC vs PD across PatchTST layers (subject level, 71 subjects)',
+             fontsize=11, fontweight='500')
+
 for ax, layer in zip(axes, LAYER_NAMES):
-    feats  = sub_acts[layer]
+    feats  = subj_acts[layer]
     scaler = StandardScaler()
     scaled = scaler.fit_transform(feats)
 
-    pca  = PCA(n_components=2, random_state=42)
-    emb  = pca.fit_transform(scaled)
-    var  = pca.explained_variance_ratio_
+    pca = PCA(n_components=2, random_state=42)
+    emb = pca.fit_transform(scaled)
+    var = pca.explained_variance_ratio_
 
     for lv in [0, 1]:
-        mask = sub_labels == lv
+        mask = subj_labels == lv
         ax.scatter(emb[mask, 0], emb[mask, 1],
                    c=colors[lv], label='HC' if lv==0 else 'PD',
-                   alpha=0.5, s=10, linewidths=0)
+                   alpha=0.85, s=60, linewidths=0.5, edgecolors='white')
 
     ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1={var[0]:.1%}  PC2={var[1]:.1%}",
                  fontsize=9)
-    ax.set_xlabel('PC1', fontsize=8); ax.set_ylabel('PC2', fontsize=8)
+    ax.set_xlabel('PC1', fontsize=8)
+    ax.set_ylabel('PC2', fontsize=8)
     ax.tick_params(labelsize=7)
     ax.spines[['top','right']].set_visible(False)
     if layer == 'embedding':
-        ax.legend(markerscale=4, fontsize=8)
+        ax.legend(markerscale=2, fontsize=8)
 
 plt.tight_layout()
-fig.savefig(osp.join(OUT_DIR, 'pca_layers.png'), dpi=150, bbox_inches='tight')
-fig.savefig(osp.join(OUT_DIR, 'pca_layers.pdf'), dpi=150, bbox_inches='tight')
-print(f"\nPCA plots saved.")
+fig.savefig(osp.join(OUT_DIR, 'pca_subject_level.png'), dpi=150, bbox_inches='tight')
+fig.savefig(osp.join(OUT_DIR, 'pca_subject_level.pdf'), dpi=150, bbox_inches='tight')
+print("\nSubject-level PCA plots saved.")
 
-# ── Step 3: Classifier per layer — 5-fold CV logistic regression ──────────────
-# Matches Celia's get_scores_classifier_layers
-# Using window-level features, 5-fold stratified CV
-
+# ── Classifier per layer — subject level ──────────────────────────────────────
 print("\n" + "="*55)
-print("CLASSIFIER AUC PER LAYER (5-fold stratified CV, window-level)")
+print("CLASSIFIER AUC PER LAYER (5-fold CV, SUBJECT level)")
 print("="*55)
 
 layer_aucs = {}
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
 for layer in LAYER_NAMES:
-    feats  = full_acts[layer]
-    aucs   = []
-    for train_idx, test_idx in skf.split(feats, full_labels):
+    feats = subj_acts[layer]
+    aucs  = []
+    for train_idx, test_idx in skf.split(feats, subj_labels):
         scaler = StandardScaler()
         X_tr   = scaler.fit_transform(feats[train_idx])
         X_te   = scaler.transform(feats[test_idx])
-        y_tr, y_te = full_labels[train_idx], full_labels[test_idx]
+        y_tr, y_te = subj_labels[train_idx], subj_labels[test_idx]
 
         clf = LogisticRegression(max_iter=1000, class_weight='balanced',
                                   random_state=42, C=1.0)
@@ -225,23 +215,20 @@ for layer in LAYER_NAMES:
 best_layer = max(layer_aucs, key=lambda k: layer_aucs[k]['mean'])
 print(f"\nBest layer: {best_layer}  (AUC={layer_aucs[best_layer]['mean']:.4f})")
 
-# ── Step 4: Save per-layer activations as .npy for DeepScan ──────────────────
-# Matches Celia's final save step — separate HC (negative) and PD (positive) files
-print("\nSaving per-layer activations for DeepScan...")
+# ── Save per-layer subject activations ────────────────────────────────────────
+print("\nSaving per-layer subject activations for DeepScan...")
 for layer in LAYER_NAMES:
-    feats = full_acts[layer]
-    hc_feats = feats[full_labels == 0]
-    pd_feats = feats[full_labels == 1]
-    np.save(osp.join(OUT_DIR, f'patchtst_hc_{layer}.npy'),  hc_feats)
-    np.save(osp.join(OUT_DIR, f'patchtst_pd_{layer}.npy'),  pd_feats)
+    hc_feats = subj_acts[layer][subj_labels == 0]
+    pd_feats = subj_acts[layer][subj_labels == 1]
+    np.save(osp.join(OUT_DIR, f'subj_hc_{layer}.npy'), hc_feats)
+    np.save(osp.join(OUT_DIR, f'subj_pd_{layer}.npy'), pd_feats)
     print(f"  {layer}: HC={hc_feats.shape}  PD={pd_feats.shape}")
 
-# Save results
 results = {
-    'layer_classifier_aucs': layer_aucs,
+    'layer_classifier_aucs_subject_level': layer_aucs,
     'best_layer': best_layer,
-    'token_strategy': 'mean over channels and patches (128-dim)',
-    'fold': 1,
+    'n_subjects': int(len(unique_subj)),
+    'token_strategy': 'mean over channels and patches per window, then mean over windows per subject (128-dim)',
 }
 with open(osp.join(OUT_DIR, 'layer_analysis_results.json'), 'w') as f:
     json.dump(results, f, indent=2)
