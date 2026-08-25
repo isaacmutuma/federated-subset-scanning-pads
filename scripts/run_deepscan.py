@@ -56,7 +56,7 @@ ACT_DIR = osp.join(C.RESULTS_DIR, 'activations')
 assert osp.exists(ACT_DIR), f"Run extract_activations.py first. Not found: {ACT_DIR}"
 os.makedirs(C.RESULTS_DIR, exist_ok=True)
 
-N_BINS   = 100
+N_BINS   = 10
 A_MAX    = 0.5
 RESTARTS = 5
 
