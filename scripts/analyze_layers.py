@@ -169,7 +169,8 @@ n_win_sample = min(300, len(test_lab))
 win_idx = np.random.choice(len(test_lab), n_win_sample, replace=False)
 win_lab_sample = test_lab[win_idx]
 
-fig_w, axes_w = plt.subplots(1, 4, figsize=(20, 5))
+fig_w, axes_w = plt.subplots(2, 2, figsize=(14, 12))
+axes_w = axes_w.flatten()
 fig_w.suptitle(
     f'PCA — HC vs PD across PatchTST layers (window level, {n_win_sample} random windows)',
     fontweight='500')
@@ -186,7 +187,7 @@ for ax, layer in zip(axes_w, LAYER_NAMES):
         mask = win_lab_sample == lv
         ax.scatter(emb[mask, 0], emb[mask, 1],
                    c=colors[lv], label='HC' if lv==0 else 'PD',
-                   alpha=0.45, s=18, linewidths=0)
+                   alpha=0.45, s=30, linewidths=0)
 
     ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1={var[0]:.1%}  PC2={var[1]:.1%}")
     ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
@@ -201,7 +202,8 @@ plt.close(fig_w)
 print("Window-level PCA saved.")
 
 # Subject-level PCA (all 71 subjects)
-fig_s, axes_s = plt.subplots(1, 4, figsize=(20, 5))
+fig_s, axes_s = plt.subplots(2, 2, figsize=(14, 12))
+axes_s = axes_s.flatten()
 fig_s.suptitle(
     f'PCA — HC vs PD across PatchTST layers (subject level, {len(unique_subj)} subjects)',
     fontweight='500')
@@ -218,7 +220,7 @@ for ax, layer in zip(axes_s, LAYER_NAMES):
         mask = subj_labels == lv
         ax.scatter(emb[mask, 0], emb[mask, 1],
                    c=colors[lv], label='HC' if lv==0 else 'PD',
-                   alpha=0.85, s=80, linewidths=0.5, edgecolors='white')
+                   alpha=0.85, s=100, linewidths=0.5, edgecolors='white')
 
     ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1={var[0]:.1%}  PC2={var[1]:.1%}")
     ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
