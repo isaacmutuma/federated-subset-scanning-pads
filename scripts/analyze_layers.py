@@ -173,7 +173,7 @@ fig_w, axes_w = plt.subplots(2, 2, figsize=(14, 12))
 axes_w = axes_w.flatten()
 fig_w.suptitle(
     f'PCA — HC vs PD across PatchTST layers (window level, {n_win_sample} random windows)',
-    fontweight='500')
+    fontsize=28, fontweight='bold')
 
 for ax, layer in zip(axes_w, LAYER_NAMES):
     feats  = win_acts[layer][win_idx]
@@ -206,7 +206,7 @@ fig_s, axes_s = plt.subplots(2, 2, figsize=(14, 12))
 axes_s = axes_s.flatten()
 fig_s.suptitle(
     f'PCA — HC vs PD across PatchTST layers (subject level, {len(unique_subj)} subjects)',
-    fontweight='500')
+    fontsize=28, fontweight='bold')
 
 for ax, layer in zip(axes_s, LAYER_NAMES):
     feats  = subj_acts[layer]
