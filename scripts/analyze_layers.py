@@ -47,14 +47,17 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# ── Global font sizes (Tanya: increase for readability) ───────────────────────
+# ── Global font sizes (bold, large — applied to all figures) ──────────────────
 plt.rcParams.update({
-    'font.size':        13,
-    'axes.titlesize':   13,
-    'axes.labelsize':   12,
-    'xtick.labelsize':  11,
-    'ytick.labelsize':  11,
-    'legend.fontsize':  11,
+    'font.size':         20,
+    'font.weight':       'bold',
+    'axes.titlesize':    20,
+    'axes.titleweight':  'bold',
+    'axes.labelsize':    18,
+    'axes.labelweight':  'bold',
+    'xtick.labelsize':   16,
+    'ytick.labelsize':   16,
+    'legend.fontsize':   16,
 })
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -169,7 +172,7 @@ n_win_sample = min(300, len(test_lab))
 win_idx = np.random.choice(len(test_lab), n_win_sample, replace=False)
 win_lab_sample = test_lab[win_idx]
 
-fig_w, axes_w = plt.subplots(2, 2, figsize=(14, 12))
+fig_w, axes_w = plt.subplots(2, 2, figsize=(16, 14))
 axes_w = axes_w.flatten()
 fig_w.suptitle(
     f'PCA — HC vs PD across PatchTST layers (window level, {n_win_sample} random windows)',
@@ -202,7 +205,7 @@ plt.close(fig_w)
 print("Window-level PCA saved.")
 
 # Subject-level PCA (all 71 subjects)
-fig_s, axes_s = plt.subplots(2, 2, figsize=(14, 12))
+fig_s, axes_s = plt.subplots(2, 2, figsize=(16, 14))
 axes_s = axes_s.flatten()
 fig_s.suptitle(
     f'PCA — HC vs PD across PatchTST layers (subject level, {len(unique_subj)} subjects)',
