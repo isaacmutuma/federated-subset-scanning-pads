@@ -47,6 +47,16 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# ── Global font sizes (Tanya: increase for readability) ───────────────────────
+plt.rcParams.update({
+    'font.size':        13,
+    'axes.titlesize':   13,
+    'axes.labelsize':   12,
+    'xtick.labelsize':  11,
+    'ytick.labelsize':  11,
+    'legend.fontsize':  11,
+})
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {device}")
 
@@ -152,11 +162,51 @@ for layer in LAYER_NAMES:
 
 # ── PCA visualization ─────────────────────────────────────────────────────────
 colors = {0: '#1baf7a', 1: '#e05c3a'}
-fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-fig.suptitle('PCA — HC vs PD across PatchTST layers (subject level, 71 subjects)',
-             fontsize=11, fontweight='500')
 
-for ax, layer in zip(axes, LAYER_NAMES):
+# Window-level PCA (300 randomly sampled windows)
+np.random.seed(42)
+n_win_sample = min(300, len(test_lab))
+win_idx = np.random.choice(len(test_lab), n_win_sample, replace=False)
+win_lab_sample = test_lab[win_idx]
+
+fig_w, axes_w = plt.subplots(1, 4, figsize=(20, 5))
+fig_w.suptitle(
+    f'PCA — HC vs PD across PatchTST layers (window level, {n_win_sample} random windows)',
+    fontweight='500')
+
+for ax, layer in zip(axes_w, LAYER_NAMES):
+    feats  = win_acts[layer][win_idx]
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(feats)
+    pca    = PCA(n_components=2, random_state=42)
+    emb    = pca.fit_transform(scaled)
+    var    = pca.explained_variance_ratio_
+
+    for lv in [0, 1]:
+        mask = win_lab_sample == lv
+        ax.scatter(emb[mask, 0], emb[mask, 1],
+                   c=colors[lv], label='HC' if lv==0 else 'PD',
+                   alpha=0.45, s=18, linewidths=0)
+
+    ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1={var[0]:.1%}  PC2={var[1]:.1%}")
+    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+    ax.spines[['top','right']].set_visible(False)
+    if layer == 'embedding':
+        ax.legend(markerscale=2)
+
+plt.tight_layout()
+fig_w.savefig(osp.join(OUT_DIR, 'pca_window_level.png'), dpi=150, bbox_inches='tight')
+fig_w.savefig(osp.join(OUT_DIR, 'pca_window_level.pdf'), dpi=150, bbox_inches='tight')
+plt.close(fig_w)
+print("Window-level PCA saved.")
+
+# Subject-level PCA (all 71 subjects)
+fig_s, axes_s = plt.subplots(1, 4, figsize=(20, 5))
+fig_s.suptitle(
+    f'PCA — HC vs PD across PatchTST layers (subject level, {len(unique_subj)} subjects)',
+    fontweight='500')
+
+for ax, layer in zip(axes_s, LAYER_NAMES):
     feats  = subj_acts[layer]
     scaler = StandardScaler()
     scaled = scaler.fit_transform(feats)
@@ -168,20 +218,19 @@ for ax, layer in zip(axes, LAYER_NAMES):
         mask = subj_labels == lv
         ax.scatter(emb[mask, 0], emb[mask, 1],
                    c=colors[lv], label='HC' if lv==0 else 'PD',
-                   alpha=0.85, s=60, linewidths=0.5, edgecolors='white')
+                   alpha=0.85, s=80, linewidths=0.5, edgecolors='white')
 
-    ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1={var[0]:.1%}  PC2={var[1]:.1%}",
-                 fontsize=9)
-    ax.set_xlabel('PC1', fontsize=8); ax.set_ylabel('PC2', fontsize=8)
-    ax.tick_params(labelsize=7)
+    ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1={var[0]:.1%}  PC2={var[1]:.1%}")
+    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
     ax.spines[['top','right']].set_visible(False)
     if layer == 'embedding':
-        ax.legend(markerscale=2, fontsize=8)
+        ax.legend(markerscale=2)
 
 plt.tight_layout()
-fig.savefig(osp.join(OUT_DIR, 'pca_subject_level.png'), dpi=150, bbox_inches='tight')
-fig.savefig(osp.join(OUT_DIR, 'pca_subject_level.pdf'), dpi=150, bbox_inches='tight')
-print("\nPCA plots saved.")
+fig_s.savefig(osp.join(OUT_DIR, 'pca_subject_level.png'), dpi=150, bbox_inches='tight')
+fig_s.savefig(osp.join(OUT_DIR, 'pca_subject_level.pdf'), dpi=150, bbox_inches='tight')
+plt.close(fig_s)
+print("Subject-level PCA saved.")
 
 # ── Clustering metrics per layer ──────────────────────────────────────────────
 # Following Celia's suggestion: Si, CH, ED, DB (Table 1, arxiv 2505.24539)
