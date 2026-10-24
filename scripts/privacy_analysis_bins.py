@@ -246,28 +246,33 @@ for n_bins in BIN_COUNTS:
 
         # DeepScan Method A: need HC test + PD test activations
         # HC test activations
-        hc_test_path = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_val_hc.npy')
-        pd_test_path = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_val_pd.npy')
-        
-        if osp.exists(hc_test_path) and osp.exists(pd_test_path):
-            hc_test_acts = np.load(hc_test_path)
-            pd_test_acts = np.load(pd_test_path)
+        full_test_path   = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_test.npy')
+        test_subj_path   = osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy')
+        test_labels_path = osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy')
+
+        if osp.exists(full_test_path) and osp.exists(test_subj_path):
+            # Use the full test set and split by labels ourselves
+            full_test_path   = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_test.npy')
+            test_subj_path   = osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy')
+            test_labels_path = osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy')
+
+            all_test_acts = np.load(full_test_path)
+            t_subj   = np.load(test_subj_path)
+            t_labels = np.load(test_labels_path)
+
+            hc_idx = (t_labels == 0)
+            pd_idx = (t_labels == 1)
+
+            hc_test_acts = all_test_acts[hc_idx]
+            pd_test_acts = all_test_acts[pd_idx]
+            hc_subj_ids  = t_subj[hc_idx]
+            pd_subj_ids  = t_subj[pd_idx]
 
             # p-values against HC train reference
             hc_test_pvals = compute_pvalues(hc_train_acts, hc_test_acts, n_bins)
             pd_test_pvals = compute_pvalues(hc_train_acts, pd_test_acts, n_bins)
 
-            # Method A: mean p-value per subject
-            # val_hc and val_pd are already split by class
-            # Use test_subj to get subject IDs, split by test_labels
-            test_subj_path   = osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy')
-            test_labels_path = osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy')
-            t_subj   = np.load(test_subj_path)
-            t_labels = np.load(test_labels_path)
-            hc_subj_ids = t_subj[t_labels == 0]
-            pd_subj_ids = t_subj[t_labels == 1]
-
-            # Compute per-subject mean p-value scores
+            # Per-subject mean p-value
             hc_scores = []
             for s in np.unique(hc_subj_ids):
                 mask = hc_subj_ids == s
