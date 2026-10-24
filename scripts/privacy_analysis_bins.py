@@ -246,18 +246,21 @@ for n_bins in BIN_COUNTS:
 
         # DeepScan Method A: need HC test + PD test activations
         # HC test activations
-        hc_test_path = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_hc_test.npy')
-        pd_test_path = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_pd_test.npy')
-
+        hc_test_path = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_val_hc.npy')
+        pd_test_path = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_val_pd.npy')
         if osp.exists(hc_test_path) and osp.exists(pd_test_path):
             hc_test_acts = np.load(hc_test_path)
             pd_test_acts = np.load(pd_test_path)
 
-            # Subject IDs for test set
-            hc_test_mask = (test_lab == 0)
-            pd_test_mask = (test_lab == 1)
-            hc_test_subj = test_subj[hc_test_mask]
-            pd_test_subj = test_subj[pd_test_mask]
+            # Subject IDs for test set — use saved test labels/subjects
+            test_labels_path = osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy')
+            test_subj_path   = osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy')
+            t_labels = np.load(test_labels_path)
+            t_subj   = np.load(test_subj_path)
+            hc_test_mask = (t_labels == 0)
+            pd_test_mask = (t_labels == 1)
+            hc_test_subj = t_subj[hc_test_mask]
+            pd_test_subj = t_subj[pd_test_mask]
 
             # p-values against HC train reference
             hc_test_pvals = compute_pvalues(hc_train_acts, hc_test_acts, n_bins)
