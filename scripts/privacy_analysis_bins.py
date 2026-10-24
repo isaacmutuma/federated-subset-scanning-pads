@@ -248,26 +248,39 @@ for n_bins in BIN_COUNTS:
         # HC test activations
         hc_test_path = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_val_hc.npy')
         pd_test_path = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_val_pd.npy')
+        
         if osp.exists(hc_test_path) and osp.exists(pd_test_path):
             hc_test_acts = np.load(hc_test_path)
             pd_test_acts = np.load(pd_test_path)
-
-            # Subject IDs for test set — use saved test labels/subjects
-            test_labels_path = osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy')
-            test_subj_path   = osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy')
-            t_labels = np.load(test_labels_path)
-            t_subj   = np.load(test_subj_path)
-            hc_test_mask = (t_labels == 0)
-            pd_test_mask = (t_labels == 1)
-            hc_test_subj = t_subj[hc_test_mask]
-            pd_test_subj = t_subj[pd_test_mask]
 
             # p-values against HC train reference
             hc_test_pvals = compute_pvalues(hc_train_acts, hc_test_acts, n_bins)
             pd_test_pvals = compute_pvalues(hc_train_acts, pd_test_acts, n_bins)
 
-            auc = deepscan_method_a(hc_test_pvals, pd_test_pvals,
-                                     hc_test_subj, pd_test_subj)
+            # Method A: mean p-value per subject
+            # val_hc and val_pd are already split by class
+            # Use test_subj to get subject IDs, split by test_labels
+            test_subj_path   = osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy')
+            test_labels_path = osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy')
+            t_subj   = np.load(test_subj_path)
+            t_labels = np.load(test_labels_path)
+            hc_subj_ids = t_subj[t_labels == 0]
+            pd_subj_ids = t_subj[t_labels == 1]
+
+            # Compute per-subject mean p-value scores
+            hc_scores = []
+            for s in np.unique(hc_subj_ids):
+                mask = hc_subj_ids == s
+                hc_scores.append(hc_test_pvals[mask].mean())
+
+            pd_scores = []
+            for s in np.unique(pd_subj_ids):
+                mask = pd_subj_ids == s
+                pd_scores.append(pd_test_pvals[mask].mean())
+
+            scores = np.array(hc_scores + pd_scores)
+            auc_labels = np.array([0]*len(hc_scores) + [1]*len(pd_scores))
+            auc = roc_auc_score(auc_labels, -scores)
             deepscan_auc_folds.append(auc)
         else:
             print(f"  [Fold {k}] HC/PD test activations not found, skipping DeepScan")
