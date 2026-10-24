@@ -164,6 +164,34 @@ for layer in LAYER_NAMES:
     print(f"  {layer}: {subj_acts[layer].shape}")
 
 # ── PCA visualization ─────────────────────────────────────────────────────────
+# ── PCA visualization ─────────────────────────────────────────────────────────
+
+# Publication style — matching privacy-utility v3
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman', 'Times', 'DejaVu Serif',
+                   'Nimbus Roman', 'TeX Gyre Termes'],
+    'mathtext.fontset': 'cm',
+    'font.size': 14,
+    'font.weight': 'bold',
+    'axes.labelsize': 16,
+    'axes.titlesize': 16,
+    'axes.labelweight': 'bold',
+    'axes.titleweight': 'bold',
+    'legend.fontsize': 13,
+    'xtick.labelsize': 13,
+    'ytick.labelsize': 13,
+    'axes.linewidth': 1.0,
+    'xtick.major.width': 1.0,
+    'ytick.major.width': 1.0,
+    'xtick.major.size': 4.0,
+    'ytick.major.size': 4.0,
+    'xtick.direction': 'in',
+    'ytick.direction': 'in',
+    'figure.dpi': 150,
+    'savefig.dpi': 300,
+})
+
 colors = {0: '#1baf7a', 1: '#e05c3a'}
 
 # Window-level PCA (300 randomly sampled windows)
@@ -172,11 +200,11 @@ n_win_sample = min(300, len(test_lab))
 win_idx = np.random.choice(len(test_lab), n_win_sample, replace=False)
 win_lab_sample = test_lab[win_idx]
 
-fig_w, axes_w = plt.subplots(2, 2, figsize=(16, 14))
+fig_w, axes_w = plt.subplots(2, 2, figsize=(14, 12))
 axes_w = axes_w.flatten()
 fig_w.suptitle(
-    f'PCA — HC vs PD across PatchTST layers (window level, {n_win_sample} random windows)',
-    fontsize=28, fontweight='bold')
+    f'PCA — HC vs PD across PatchTST layers (window level, {n_win_sample} windows)',
+    fontsize=20, fontweight='bold', y=0.98)
 
 for ax, layer in zip(axes_w, LAYER_NAMES):
     feats  = win_acts[layer][win_idx]
@@ -190,26 +218,31 @@ for ax, layer in zip(axes_w, LAYER_NAMES):
         mask = win_lab_sample == lv
         ax.scatter(emb[mask, 0], emb[mask, 1],
                    c=colors[lv], label='HC' if lv==0 else 'PD',
-                   alpha=0.45, s=30, linewidths=0)
+                   alpha=0.45, s=35, linewidths=0)
 
-    ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1={var[0]:.1%}  PC2={var[1]:.1%}")
-    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+    ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1 = {var[0]:.1%}   PC2 = {var[1]:.1%}",
+                 fontsize=15, fontweight='bold', pad=8)
+    ax.set_xlabel('PC1', fontsize=14, fontweight='bold')
+    ax.set_ylabel('PC2', fontsize=14, fontweight='bold')
     ax.spines[['top','right']].set_visible(False)
+    ax.spines['left'].set_linewidth(1.0)
+    ax.spines['bottom'].set_linewidth(1.0)
     if layer == 'embedding':
-        ax.legend(markerscale=2)
+        ax.legend(markerscale=2.5, fontsize=13, frameon=True,
+                  edgecolor='#cccccc', fancybox=False, framealpha=0.9)
 
 plt.tight_layout()
-fig_w.savefig(osp.join(OUT_DIR, 'pca_window_level.png'), dpi=150, bbox_inches='tight')
-fig_w.savefig(osp.join(OUT_DIR, 'pca_window_level.pdf'), dpi=150, bbox_inches='tight')
+fig_w.savefig(osp.join(OUT_DIR, 'pca_window_level.png'), dpi=300, bbox_inches='tight')
+fig_w.savefig(osp.join(OUT_DIR, 'pca_window_level.pdf'), dpi=300, bbox_inches='tight')
 plt.close(fig_w)
 print("Window-level PCA saved.")
 
-# Subject-level PCA (all 71 subjects)
-fig_s, axes_s = plt.subplots(2, 2, figsize=(16, 14))
+# Subject-level PCA (all subjects)
+fig_s, axes_s = plt.subplots(2, 2, figsize=(14, 12))
 axes_s = axes_s.flatten()
 fig_s.suptitle(
     f'PCA — HC vs PD across PatchTST layers (subject level, {len(unique_subj)} subjects)',
-    fontsize=28, fontweight='bold')
+    fontsize=20, fontweight='bold', y=0.98)
 
 for ax, layer in zip(axes_s, LAYER_NAMES):
     feats  = subj_acts[layer]
@@ -223,17 +256,22 @@ for ax, layer in zip(axes_s, LAYER_NAMES):
         mask = subj_labels == lv
         ax.scatter(emb[mask, 0], emb[mask, 1],
                    c=colors[lv], label='HC' if lv==0 else 'PD',
-                   alpha=0.85, s=100, linewidths=0.5, edgecolors='white')
+                   alpha=0.85, s=110, linewidths=0.8, edgecolors='white')
 
-    ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1={var[0]:.1%}  PC2={var[1]:.1%}")
-    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+    ax.set_title(f"{LAYER_DISPLAY[layer]}\nPC1 = {var[0]:.1%}   PC2 = {var[1]:.1%}",
+                 fontsize=15, fontweight='bold', pad=8)
+    ax.set_xlabel('PC1', fontsize=14, fontweight='bold')
+    ax.set_ylabel('PC2', fontsize=14, fontweight='bold')
     ax.spines[['top','right']].set_visible(False)
+    ax.spines['left'].set_linewidth(1.0)
+    ax.spines['bottom'].set_linewidth(1.0)
     if layer == 'embedding':
-        ax.legend(markerscale=2)
+        ax.legend(markerscale=2, fontsize=13, frameon=True,
+                  edgecolor='#cccccc', fancybox=False, framealpha=0.9)
 
 plt.tight_layout()
-fig_s.savefig(osp.join(OUT_DIR, 'pca_subject_level.png'), dpi=150, bbox_inches='tight')
-fig_s.savefig(osp.join(OUT_DIR, 'pca_subject_level.pdf'), dpi=150, bbox_inches='tight')
+fig_s.savefig(osp.join(OUT_DIR, 'pca_subject_level.png'), dpi=300, bbox_inches='tight')
+fig_s.savefig(osp.join(OUT_DIR, 'pca_subject_level.pdf'), dpi=300, bbox_inches='tight')
 plt.close(fig_s)
 print("Subject-level PCA saved.")
 
