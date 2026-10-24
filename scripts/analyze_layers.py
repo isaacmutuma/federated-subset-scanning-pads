@@ -164,9 +164,7 @@ for layer in LAYER_NAMES:
     print(f"  {layer}: {subj_acts[layer].shape}")
 
 # ── PCA visualization ─────────────────────────────────────────────────────────
-# ── PCA visualization ─────────────────────────────────────────────────────────
-
-# Publication style — matching privacy-utility v3
+# ── Publication style (serif, bold — matching privacy-utility v3) ─────────────
 plt.rcParams.update({
     'font.family': 'serif',
     'font.serif': ['Times New Roman', 'Times', 'DejaVu Serif',
