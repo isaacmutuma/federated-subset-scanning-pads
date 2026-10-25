@@ -17,6 +17,9 @@ For each fold saves (per layer):
   activations_fold{k}_{layer}_test.npy      — all test windows (n_test, 128)
   activations_fold{k}_{layer}_test_labels.npy
   activations_fold{k}_{layer}_test_subj.npy
+  activations_fold{k}_{layer}_dd.npy        — all DD subjects (never in any fold)
+  activations_fold{k}_{split}_{subj,task,wrist}.npy — per-window metadata,
+        split in {hc_train, val_hc, val_pd, test, dd} (test_subj saved as before)
   activations_fold{k}_norm_mean.npy
   activations_fold{k}_norm_std.npy
 
@@ -109,31 +112,50 @@ PD_STR = next(l for l in all_labels_found if 'parkinson' in l.lower() or l == 'P
 LABEL_MAP = {HC_STR: 0, PD_STR: 1}
 print(f'HC="{HC_STR}"  PD="{PD_STR}"')
 
+DD_STRS = [l for l in all_labels_found if l not in (HC_STR, PD_STR)]
+print(f'Other (DD) labels: {DD_STRS}  '
+      f'subjects: {manifest[manifest["label"].isin(DD_STRS)]["patient_id"].nunique()}')
+
+def window_recordings(df, label_of):
+    """Window every recording in df. Returns windows, labels, subject_ids, tasks, wrists."""
+    all_windows, all_labels_out, all_subject_ids = [], [], []
+    all_tasks, all_wrists = [], []
+    skipped = 0
+    for _, row in df.iterrows():
+        fp = osp.join(BASE_PATH, 'movement', row['filepath'])
+        if not osp.exists(fp): skipped += 1; continue
+        try:    signal = load_timeseries(fp)
+        except: skipped += 1; continue
+        if signal.shape[1] < C.WINDOW_SIZE * C.N_WINDOWS: skipped += 1; continue
+        sig_filt = bandpass_filter(signal, lowcut=C.LOWCUT, highcut=C.HIGHCUT, fs=C.FS)
+        wins     = segment_windows(sig_filt, window_size=C.WINDOW_SIZE, step=C.WINDOW_SIZE)[:C.N_WINDOWS]
+        if len(wins) < C.N_WINDOWS: skipped += 1; continue
+        all_windows.append(wins)
+        all_labels_out.extend([label_of(row['label'])] * len(wins))
+        all_subject_ids.extend([int(row['patient_id'])] * len(wins))
+        all_tasks.extend([str(row['task'])] * len(wins))
+        all_wrists.extend([str(row['wrist'])] * len(wins))
+    windows = np.concatenate(all_windows, axis=0)
+    print(f"  Windows: {windows.shape}  Skipped recordings: {skipped}  "
+          f"Windows per subject: {len(windows) / len(np.unique(all_subject_ids)):.1f}")
+    return (windows, np.array(all_labels_out, dtype=np.int64),
+            np.array(all_subject_ids, dtype=np.int64),
+            np.array(all_tasks), np.array(all_wrists))
+
 filtered = manifest[manifest['label'].isin([HC_STR, PD_STR])].copy()
+dd_rows  = manifest[manifest['label'].isin(DD_STRS)].copy()
 if C.TRAIN_WRIST is not None:
     filtered = filtered[filtered['wrist'] == C.TRAIN_WRIST]
+    dd_rows  = dd_rows[dd_rows['wrist'] == C.TRAIN_WRIST]
 print(f'Subjects: {filtered["patient_id"].nunique()}  Rows: {len(filtered)}')
 
-all_windows, all_labels_out, all_subject_ids = [], [], []
-skipped = 0
-print("Windowing...")
-for _, row in filtered.iterrows():
-    fp = osp.join(BASE_PATH, 'movement', row['filepath'])
-    if not osp.exists(fp): skipped += 1; continue
-    try:    signal = load_timeseries(fp)
-    except: skipped += 1; continue
-    if signal.shape[1] < C.WINDOW_SIZE * C.N_WINDOWS: skipped += 1; continue
-    sig_filt = bandpass_filter(signal, lowcut=C.LOWCUT, highcut=C.HIGHCUT, fs=C.FS)
-    wins     = segment_windows(sig_filt, window_size=C.WINDOW_SIZE, step=C.WINDOW_SIZE)[:C.N_WINDOWS]
-    if len(wins) < C.N_WINDOWS: skipped += 1; continue
-    all_windows.append(wins)
-    all_labels_out.extend([LABEL_MAP[row['label']]] * len(wins))
-    all_subject_ids.extend([int(row['patient_id'])] * len(wins))
+print("Windowing HC/PD...")
+windows, labels, subject_ids, tasks, wrists = window_recordings(filtered, LABEL_MAP.get)
+print(f"  HC={(labels==0).sum()}  PD={(labels==1).sum()}")
 
-windows     = np.concatenate(all_windows, axis=0)
-labels      = np.array(all_labels_out,  dtype=np.int64)
-subject_ids = np.array(all_subject_ids, dtype=np.int64)
-print(f"Windows: {windows.shape}  HC={(labels==0).sum()}  PD={(labels==1).sum()}")
+# DD subjects are never in any fold: every fold's model scores all of them
+print("Windowing DD...")
+dd_windows, _, dd_subj, dd_task, dd_wrist = window_recordings(dd_rows, lambda _: 2)
 
 unique_subjects = np.unique(subject_ids)
 subject_labels  = np.array([labels[subject_ids == s][0] for s in unique_subjects])
@@ -141,6 +163,8 @@ folds = generate_fold_splits(unique_subjects, subject_labels,
                               n_splits=C.N_SPLITS, random_state=C.RANDOM_STATE,
                               val_fraction=0.2,
                               save_path=osp.join(C.OUTPUT_DIR, 'fold_splits.pkl'))
+
+LAYERS_TO_EXTRACT = ['layer_0', 'layer_1', 'layer_2']
 
 # ── PatchTST model with hooks for Layer 1 and Layer 2 ────────────────────────
 from transformers import PatchTSTConfig, PatchTSTModel
@@ -186,7 +210,7 @@ class PatchTSTClassifier(nn.Module):
 def extract_acts(model, win_array, lab_array, batch_size=128):
     """
     Run windows through encoder.
-    Returns dict: {'layer_1': (n, 128), 'layer_2': (n, 128)}
+    Returns dict: {layer_name: (n, 128)} for every layer in LAYERS_TO_EXTRACT
     Token strategy: mean over channels AND patches → 128-dim
     """
     hook_outputs = {}
@@ -197,25 +221,26 @@ def extract_acts(model, win_array, lab_array, batch_size=128):
             hook_outputs[name] = h.detach().cpu()
         return hook
 
-    h1 = model.encoder.encoder.layers[1].register_forward_hook(make_hook('layer_1'))
-    h2 = model.encoder.encoder.layers[2].register_forward_hook(make_hook('layer_2'))
+    handles = [model.encoder.encoder.layers[int(name.split('_')[1])]
+               .register_forward_hook(make_hook(name)) for name in LAYERS_TO_EXTRACT]
 
     loader = DataLoader(PADSDataset(win_array, lab_array),
                         batch_size=batch_size, shuffle=False)
-    collected = {'layer_1': [], 'layer_2': []}
+    collected = {name: [] for name in LAYERS_TO_EXTRACT}
     with torch.no_grad():
         for x, _ in loader:
             _ = model(x.to(device))
             for name in collected:
-                # mean over channels (6) and patches (185) → (batch, 128)
+                # mean over channels (6) and patches (24) → (batch, 128)
                 collected[name].append(hook_outputs[name].numpy().mean(axis=(1, 2)))
 
-    h1.remove(); h2.remove()
+    for h in handles: h.remove()
     return {n: np.concatenate(v, axis=0) for n, v in collected.items()}
 
 
 # ── Extract per fold ──────────────────────────────────────────────────────────
-LAYERS_TO_EXTRACT = ['layer_1', 'layer_2']
+# Set True after retraining checkpoints, otherwise stale activations are reused
+FORCE_REEXTRACT = os.environ.get('FORCE_REEXTRACT', '0') == '1'
 
 for fold_idx, fold in enumerate(folds):
     k = fold_idx + 1
@@ -224,10 +249,10 @@ for fold_idx, fold in enumerate(folds):
 
     print(f"\n{'='*55}\nFOLD {k}/{C.N_SPLITS}\n{'='*55}")
 
-    # Skip if already extracted for both layers
-    files_needed = [f'activations_fold{k}_layer_2_hc_train.npy',
-                    f'activations_fold{k}_layer_1_hc_train.npy']
-    if all(osp.exists(osp.join(ACT_DIR, f)) for f in files_needed):
+    # Skip if already extracted for both layers (incl. metadata added for federated sim)
+    files_needed = [f'activations_fold{k}_{layer}_hc_train.npy' for layer in LAYERS_TO_EXTRACT]
+    files_needed.append(f'activations_fold{k}_dd_subj.npy')
+    if not FORCE_REEXTRACT and all(osp.exists(osp.join(ACT_DIR, f)) for f in files_needed):
         print(f"Already extracted — skipping fold {k}")
         continue
 
@@ -239,11 +264,15 @@ for fold_idx, fold in enumerate(folds):
     val_win,   val_lab   = windows[val_mask],   labels[val_mask]
     test_win,  test_lab  = windows[test_mask],  labels[test_mask]
     test_subj            = subject_ids[test_mask]
+    train_subj, val_subj = subject_ids[train_mask], subject_ids[val_mask]
+    train_task, val_task, test_task = tasks[train_mask], tasks[val_mask], tasks[test_mask]
+    train_wrist, val_wrist, test_wrist = wrists[train_mask], wrists[val_mask], wrists[test_mask]
 
     mean, std = compute_normalization_stats(train_win)
     train_win = apply_normalization(train_win, mean, std)
     val_win   = apply_normalization(val_win,   mean, std)
     test_win  = apply_normalization(test_win,  mean, std)
+    dd_win    = apply_normalization(dd_windows, mean, std)
 
     hc_train_win = train_win[train_lab == 0]
     val_hc_win   = val_win[val_lab == 0]
@@ -273,6 +302,9 @@ for fold_idx, fold in enumerate(folds):
     print("Extracting test activations...")
     test_acts = extract_acts(model, test_win, test_lab)
 
+    print("Extracting DD activations...")
+    dd_acts = extract_acts(model, dd_win, np.zeros(len(dd_win), dtype=np.int64))
+
     # Save for each layer
     for layer in LAYERS_TO_EXTRACT:
         print(f"  Saving {layer}: {hc_train_acts[layer].shape}")
@@ -284,13 +316,27 @@ for fold_idx, fold in enumerate(folds):
                 val_pd_acts[layer])
         np.save(osp.join(ACT_DIR, f'activations_fold{k}_{layer}_test.npy'),
                 test_acts[layer])
+        np.save(osp.join(ACT_DIR, f'activations_fold{k}_{layer}_dd.npy'),
+                dd_acts[layer])
 
     # Shared files (same for both layers)
     np.save(osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy'), test_lab)
     np.save(osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy'),   test_subj)
+    # Per-window metadata, row-aligned with the activation files above
+    hc_tr, v_hc, v_pd = train_lab == 0, val_lab == 0, val_lab == 1
+    meta = {'hc_train': (train_subj[hc_tr], train_task[hc_tr], train_wrist[hc_tr]),
+            'val_hc':   (val_subj[v_hc],    val_task[v_hc],    val_wrist[v_hc]),
+            'val_pd':   (val_subj[v_pd],    val_task[v_pd],    val_wrist[v_pd]),
+            'test':     (test_subj,         test_task,         test_wrist),
+            'dd':       (dd_subj,           dd_task,           dd_wrist)}
+    for split, (s, t, w) in meta.items():
+        if split != 'test':
+            np.save(osp.join(ACT_DIR, f'activations_fold{k}_{split}_subj.npy'), s)
+        np.save(osp.join(ACT_DIR, f'activations_fold{k}_{split}_task.npy'),  t)
+        np.save(osp.join(ACT_DIR, f'activations_fold{k}_{split}_wrist.npy'), w)
     np.save(osp.join(ACT_DIR, f'activations_fold{k}_norm_mean.npy'),   mean)
     np.save(osp.join(ACT_DIR, f'activations_fold{k}_norm_std.npy'),    std)
-    print(f"Saved fold {k} — Layer 1 and Layer 2 activations (128-dim each)")
+    print(f"Saved fold {k} — {LAYERS_TO_EXTRACT} activations (128-dim each)")
 
 print("\nAll folds done.")
 print(f"Files in {ACT_DIR}:")

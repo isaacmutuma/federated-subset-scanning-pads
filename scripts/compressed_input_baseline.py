@@ -12,8 +12,7 @@ Three compression methods:
   2. PCA           — fit PCA on HC train windows, reduce to 60 components → 60-dim
   3. Statistical   — mean, std, min, max, energy per channel → 30-dim
 
-Baseline comparison:
-  PatchTST Layer 2 (learned representations) → 128-dim → 0.861 AUC
+Baseline comparison: PatchTST Layer 2 results from run_deepscan.py (same reference settings).
 
 Method A (simple mean p-value) used throughout for fair comparison.
 N_BINS=10 (selected from privacy-utility sweep).
@@ -48,8 +47,10 @@ from src.data.preprocessing import (bandpass_filter, segment_windows,
 from src.data.folds import generate_fold_splits
 from src.training.metrics import (compute_metrics, aggregate_fold_metrics,
                                    print_fold_results, print_summary)
+from src.scanning.histograms import make_global_edges, site_counts, pvalues_from_counts
 
 N_BINS = 10   # from privacy-utility sweep
+ALPHA  = 1.0  # Laplace smoothing, as in run_deepscan.py
 
 # ── Load PADS data ─────────────────────────────────────────────────────────────
 if C.PADS_ZIP and not osp.exists(C.PADS_ROOT):
@@ -160,42 +161,18 @@ def compress_statistical(wins):
     return feats.reshape(len(wins), -1)             # (n, 30)
 
 
-def compress_pca(train_wins, test_wins, n_components=60):
-    """
-    PCA compression: fit on HC train windows, transform all.
-    Input: (n, 6, 200) → flatten → (n, 1200) → PCA → (n, 60)
-    """
-    n_tr = train_wins.reshape(len(train_wins), -1)
-    n_te = test_wins.reshape(len(test_wins), -1)
-    pca  = PCA(n_components=n_components, random_state=42)
-    pca.fit(n_tr)
-    return pca.transform(n_tr), pca.transform(n_te)
-
-
 # ── Histogram p-value scoring (Method A) ──────────────────────────────────────
-def compute_pvalues_directed(hc_ref, test_feats, val_pd_feats, n_bins=N_BINS):
-    """Directed one-tailed histogram p-values. Low p = anomalous."""
-    n_dims    = hc_ref.shape[1]
-    direction = val_pd_feats.mean(0) > hc_ref.mean(0)
-    p_matrix  = np.zeros((len(test_feats), n_dims), dtype=np.float64)
-    for j in range(n_dims):
-        counts, edges = np.histogram(hc_ref[:, j], bins=n_bins, density=False)
-        counts = counts.astype(float) + 1e-6
-        probs  = counts / counts.sum()
-        cum    = np.cumsum(probs)
-        idx    = np.clip(np.searchsorted(edges[1:], test_feats[:, j], side='right'),
-                         0, len(probs)-1)
-        lower  = np.where(idx > 0, cum[idx-1], 0.0)
-        if direction[j]:
-            p_matrix[:, j] = np.clip(1.0 - lower, 1e-6, 1.0)
-        else:
-            p_matrix[:, j] = np.clip(lower + probs[idx], 1e-6, 1.0)
-    return p_matrix
+# Same reference construction as run_deepscan.py: shared edges from HC train,
+# counts from held-out val HC. Both tail rules are reported: band-passed signals are
+# ~zero-mean, so a direction set from the mean shift is unreliable for these features.
+TAILS = ['directed', 'two_tailed']
 
 
-def run_deepscan_method_a(hc_ref, val_pd_feats, test_feats, test_lab, test_subj):
+def run_deepscan_method_a(hc_edges, hc_ref, val_pd_feats, test_feats, test_lab, test_subj, tails):
     """Method A: 1 - mean(p-values) per window, mean per subject."""
-    p_matrix    = compute_pvalues_directed(hc_ref, test_feats, val_pd_feats)
+    edges     = make_global_edges(hc_edges, N_BINS)
+    direction = (val_pd_feats.mean(0) > hc_edges.mean(0)) if tails == 'directed' else None
+    p_matrix  = pvalues_from_counts(site_counts(hc_ref, edges), edges, test_feats, direction, ALPHA)
     win_scores  = 1.0 - p_matrix.mean(axis=1)
     unique_subj = np.unique(test_subj)
     subj_scores = np.array([win_scores[test_subj==s].mean() for s in unique_subj])
@@ -204,13 +181,10 @@ def run_deepscan_method_a(hc_ref, val_pd_feats, test_feats, test_lab, test_subj)
 
 
 # ── Run all compression methods across 5 folds ────────────────────────────────
-COMPRESSION_METHODS = {
-    'Mean pooling (60-dim)':     'mean_pool',
-    'Statistical features (30-dim)': 'statistical',
-    'PCA compression (60-dim)':  'pca',
-}
+COMPRESSION_METHODS = ['Mean pooling (60-dim)', 'Statistical features (30-dim)',
+                       'PCA compression (60-dim)']
 
-results = {name: [] for name in COMPRESSION_METHODS}
+results = {f'{name} [{t}]': [] for name in COMPRESSION_METHODS for t in TAILS}
 RESULTS_FILE = osp.join(C.RESULTS_DIR, 'compressed_input_baseline.json')
 
 for fold_idx, fold in enumerate(folds):
@@ -232,69 +206,50 @@ for fold_idx, fold in enumerate(folds):
     val_win   = apply_normalization(val_win,   mean, std)
     test_win  = apply_normalization(test_win,  mean, std)
 
-    # HC train and val PD for direction mask
+    # HC train -> edges (+ PCA fit); held-out val HC -> reference; val PD -> direction
     hc_train_win = train_win[train_lab == 0]
+    val_hc_win   = val_win[val_lab == 0]
     val_pd_win   = val_win[val_lab == 1]
 
-    print(f"HC train: {hc_train_win.shape[0]:,}  Val PD: {val_pd_win.shape[0]:,}  "
-          f"Test: {test_win.shape[0]:,}")
+    print(f"HC train: {hc_train_win.shape[0]:,}  Val HC: {val_hc_win.shape[0]:,}  "
+          f"Val PD: {val_pd_win.shape[0]:,}  Test: {test_win.shape[0]:,}")
 
-    # ── Method 1: Mean pooling ────────────────────────────────────────────────
-    hc_mp  = compress_mean_pool(hc_train_win)
-    vpd_mp = compress_mean_pool(val_pd_win)
-    te_mp  = compress_mean_pool(test_win)
-    auc_mp = run_deepscan_method_a(hc_mp, vpd_mp, te_mp, test_lab, test_subj)
-    results['Mean pooling (60-dim)'].append(auc_mp)
-    print(f"  Mean pooling AUC:        {auc_mp:.4f}")
-
-    # ── Method 2: Statistical features ───────────────────────────────────────
-    hc_st  = compress_statistical(hc_train_win)
-    vpd_st = compress_statistical(val_pd_win)
-    te_st  = compress_statistical(test_win)
-    auc_st = run_deepscan_method_a(hc_st, vpd_st, te_st, test_lab, test_subj)
-    results['Statistical features (30-dim)'].append(auc_st)
-    print(f"  Statistical features AUC: {auc_st:.4f}")
-
-    # ── Method 3: PCA compression ─────────────────────────────────────────────
-    # Fit PCA on HC train windows only
-    hc_pca_tr, _ = compress_pca(hc_train_win, hc_train_win, n_components=60)
-    _, vpd_pca   = compress_pca(hc_train_win, val_pd_win,   n_components=60)
-    _, te_pca    = compress_pca(hc_train_win, test_win,     n_components=60)
-    auc_pca = run_deepscan_method_a(hc_pca_tr, vpd_pca, te_pca, test_lab, test_subj)
-    results['PCA compression (60-dim)'].append(auc_pca)
-    print(f"  PCA compression AUC:     {auc_pca:.4f}")
+    pca = PCA(n_components=60, random_state=42).fit(hc_train_win.reshape(len(hc_train_win), -1))
+    pca_t = lambda w: pca.transform(w.reshape(len(w), -1))
+    feats = {
+        'Mean pooling (60-dim)':         compress_mean_pool,
+        'Statistical features (30-dim)': compress_statistical,
+        'PCA compression (60-dim)':      pca_t,
+    }
+    for name, fn in feats.items():
+        f_tr, f_ref, f_pd, f_te = fn(hc_train_win), fn(val_hc_win), fn(val_pd_win), fn(test_win)
+        for t in TAILS:
+            auc = run_deepscan_method_a(f_tr, f_ref, f_pd, f_te, test_lab, test_subj, t)
+            results[f'{name} [{t}]'].append(auc)
+            print(f"  {name:<32} {t:<11} AUC: {auc:.4f}")
 
     # Save intermediate
     with open(RESULTS_FILE, 'w') as f:
-        json.dump({'results': {k: v for k, v in results.items()},
-                   'folds_complete': fold_idx+1, 'n_bins': N_BINS}, f, indent=2)
+        json.dump({'results': results, 'folds_complete': fold_idx+1, 'n_bins': N_BINS}, f, indent=2)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n{'='*60}")
 print("COMPRESSED INPUT BASELINE — DeepScan Method A (mean p-value)")
 print(f"{'='*60}")
-print(f"{'Representation':<35} {'Mean AUC':>10} {'Std':>8}")
-print("-"*55)
-
+print(f"{'Representation':<48} {'Mean AUC':>10} {'Std':>8}")
+print("-"*68)
 for name, aucs in results.items():
-    print(f"{name:<35} {np.mean(aucs):>10.4f} {np.std(aucs):>8.4f}")
-
-print("-"*55)
-print(f"{'PatchTST Layer 2 (learned)':<35} {'0.8611':>10} {'0.0677':>8}")
-print(f"{'PatchTST supervised':<35} {'0.9041':>10} {'0.0542':>8}")
-print(f"{'='*60}")
-print("\nConclusion: learned representations from PatchTST encoder are")
-print("necessary for effective histogram-based anomaly detection.")
+    print(f"{name:<48} {np.mean(aucs):>10.4f} {np.std(aucs):>8.4f}")
+print("Compare against deepscan_results_layer_2.json (same reference settings).")
 
 with open(RESULTS_FILE, 'w') as f:
     json.dump({
-        'results':         {k: v for k, v in results.items()},
-        'summary':         {k: {'mean': float(np.mean(v)), 'std': float(np.std(v))}
-                            for k, v in results.items()},
-        'patchtst_layer2': {'mean': 0.8611, 'std': 0.0677},
-        'patchtst_supervised': {'mean': 0.9041, 'std': 0.0542},
-        'n_bins': N_BINS,
-        'method': 'DeepScan Method A — mean p-value, directed histogram',
+        'results': results,
+        'summary': {k: {'mean': float(np.mean(v)), 'std': float(np.std(v))}
+                    for k, v in results.items()},
+        'n_bins': N_BINS, 'alpha': ALPHA,
+        'method': 'DeepScan Method A — edges from HC train, reference = val HC, '
+                  'directed and two-tailed p-values',
     }, f, indent=2)
 
 print(f"\nResults: {RESULTS_FILE}")

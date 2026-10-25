@@ -4,9 +4,19 @@ privacy_analysis_bins.py
 Extended privacy analysis: runs re-identification attack across multiple
 histogram bin counts to generate the privacy-utility trade-off curve.
 
+Uses exactly the representation the deployed pipeline computes (src/scanning/histograms.py,
+same settings as run_deepscan.py): shared edges from HC train, reference counts from
+BACKGROUND, directed one-tailed p-values with Laplace smoothing.
+
+Attack (closed-set window -> subject linkage):
+  - HC train subjects of each fold (~50); 80% of each subject's windows train a
+    multinomial logistic regression, 20% are attacked. Chance Top-1 = 1/n_subjects.
+
 For each bin count, computes:
   - Re-identification accuracy (Top-1, Top-5) on histogram p-values
-  - DeepScan Method A AUC (mean p-value, subject-level)
+  - Re-identification on quantised raw activations (bin index, same edges) — baseline
+    that separates the effect of p-value scoring from plain quantisation
+  - DeepScan Method A AUC (mean p-value, subject-level) — matches run_deepscan.py
 
 Raw activation re-identification is bin-independent (computed once).
 
@@ -16,7 +26,7 @@ Run:
     python scripts/privacy_analysis_bins.py
 """
 
-import sys, os, os.path as osp, json, warnings, pickle
+import sys, os, os.path as osp, json, subprocess, warnings
 warnings.filterwarnings('ignore')
 
 import numpy as np
@@ -31,285 +41,137 @@ import config as C
 sys.path.insert(0, C.REPO_DIR)
 os.chdir(C.REPO_DIR)
 
+from src.scanning.histograms import make_global_edges, site_counts, pvalues_from_counts, bin_index
+
 ACT_DIR = osp.join(C.RESULTS_DIR, 'activations')
 assert osp.exists(ACT_DIR), f"Run extract_activations.py first. Not found: {ACT_DIR}"
 os.makedirs(C.RESULTS_DIR, exist_ok=True)
 
 BIN_COUNTS   = [5, 10, 20, 50, 100]
 LAYER        = 'layer_2'
+BACKGROUND   = os.environ.get('BACKGROUND', 'val_hc')   # keep identical to run_deepscan.py
+ALPHA        = 1.0
 TEST_FRAC    = 0.2
 RANDOM_STATE = 42
 
+try:
+    GIT_COMMIT = subprocess.check_output(['git', '-C', C.REPO_DIR, 'rev-parse', 'HEAD'],
+                                         text=True).strip()
+except Exception:
+    GIT_COMMIT = 'unknown'
+
 print(f"Privacy-utility sweep across bin counts: {BIN_COUNTS}")
-print(f"Layer: {LAYER}  |  Test fraction: {TEST_FRAC}")
+print(f"Layer: {LAYER}  |  Background: {BACKGROUND}  |  Test fraction: {TEST_FRAC}")
 
 
-def compute_pvalues(hc_acts_ref, query_acts, n_bins):
-    """
-    Build per-dimension histograms from hc_acts_ref.
-    Compute two-tailed p-values for each query window.
-    Returns p_matrix: (n_query, 128)
-    """
-    n_query, n_dims = query_acts.shape
-    p_matrix = np.zeros((n_query, n_dims), dtype=np.float64)
-
-    for j in range(n_dims):
-        counts, edges = np.histogram(hc_acts_ref[:, j], bins=n_bins, density=False)
-        counts  = counts.astype(float) + 1e-6
-        probs   = counts / counts.sum()
-        cum     = np.cumsum(probs)
-
-        bin_idx = np.clip(np.searchsorted(edges[1:], query_acts[:, j], side='right'),
-                          0, len(probs) - 1)
-        lower   = np.where(bin_idx > 0, cum[bin_idx - 1], 0.0)
-        p_upper = np.clip(1.0 - lower, 1e-6, 1.0)
-        p_lower = np.clip(lower + probs[bin_idx], 1e-6, 1.0)
-        p_matrix[:, j] = np.minimum(p_upper, p_lower)
-
-    return p_matrix
+def act_path(k, name):
+    return osp.join(ACT_DIR, f'activations_fold{k}_{name}.npy')
 
 
 def top_k_accuracy(y_true, probs, k=5):
     """Fraction of samples where true label is in top-k predictions."""
     top_k_preds = np.argsort(probs, axis=1)[:, -k:]
-    correct = sum(y_true[i] in top_k_preds[i] for i in range(len(y_true)))
-    return correct / len(y_true)
+    return float(np.mean([y_true[i] in top_k_preds[i] for i in range(len(y_true))]))
 
 
-def deepscan_method_a(hc_pvals, pd_pvals, hc_subjects, pd_subjects):
-    """
-    Method A: mean p-value per subject.
-    Lower mean p-value = more anomalous.
-    Returns subject-level AUC (HC=0 vs PD=1).
-    """
-    # HC subject scores
-    hc_scores = []
-    for s in np.unique(hc_subjects):
-        mask = hc_subjects == s
-        mean_p = hc_pvals[mask].mean()
-        hc_scores.append(mean_p)
-
-    # PD subject scores
-    pd_scores = []
-    for s in np.unique(pd_subjects):
-        mask = pd_subjects == s
-        mean_p = pd_pvals[mask].mean()
-        pd_scores.append(mean_p)
-
-    # AUC: lower mean p-value = anomalous (PD), so negate for AUC
-    scores = np.array(hc_scores + pd_scores)
-    labels = np.array([0]*len(hc_scores) + [1]*len(pd_scores))
-    # Negate because lower p = more anomalous = PD
-    auc = roc_auc_score(labels, -scores)
-    return auc
+def reid_attack(X, y, train_idx, test_idx):
+    """Multinomial LR re-identification. Returns (top1, top5)."""
+    scaler = StandardScaler()
+    Xtr = scaler.fit_transform(X[train_idx])
+    Xte = scaler.transform(X[test_idx])
+    clf = LogisticRegression(max_iter=1000, class_weight='balanced', C=1.0,
+                             random_state=RANDOM_STATE, solver='lbfgs')
+    clf.fit(Xtr, y[train_idx])
+    probs = clf.predict_proba(Xte)
+    return (accuracy_score(y[test_idx], clf.classes_[probs.argmax(axis=1)]),
+            top_k_accuracy(np.searchsorted(clf.classes_, y[test_idx]), probs, k=5))
 
 
-# ── Load shared data ──────────────────────────────────────────────────────────
-with open(osp.join(C.OUTPUT_DIR, 'fold_splits.pkl'), 'rb') as f:
-    folds = pickle.load(f)
-
-windows     = np.load(osp.join(C.OUTPUT_DIR, 'windows.npy'))
-labels      = np.load(osp.join(C.OUTPUT_DIR, 'labels.npy'))
-subject_ids = np.load(osp.join(C.OUTPUT_DIR, 'subject_ids.npy'))
+def method_a_auc(p_matrix, subj, lab):
+    win = 1.0 - p_matrix.mean(axis=1)
+    us = np.unique(subj)
+    return roc_auc_score([lab[subj == s][0] for s in us], [win[subj == s].mean() for s in us])
 
 
-# ── Main sweep ────────────────────────────────────────────────────────────────
+def summarise(values):
+    return {'mean': float(np.mean(values)), 'std': float(np.std(values)),
+            'per_fold': [float(x) for x in values]}
+
+
+# ── Per-fold data + fixed attack split (identical for every representation) ───
+fold_data = []
+for k in range(1, C.N_SPLITS + 1):
+    hc_train = np.load(act_path(k, f'{LAYER}_hc_train'))
+    hc_subj  = np.load(act_path(k, 'hc_train_subj'))
+    rng = np.random.RandomState(RANDOM_STATE)
+    tr, te = [], []
+    for s in np.unique(hc_subj):
+        idx = np.where(hc_subj == s)[0]
+        sel = rng.choice(idx, max(1, int(len(idx) * TEST_FRAC)), replace=False)
+        tr.extend(np.setdiff1d(idx, sel)); te.extend(sel)
+    fold_data.append({
+        'k': k, 'hc_train': hc_train, 'hc_subj': hc_subj,
+        'bg': np.load(act_path(k, f'{LAYER}_{BACKGROUND}')),
+        'val_pd': np.load(act_path(k, f'{LAYER}_val_pd')),
+        'test': np.load(act_path(k, f'{LAYER}_test')),
+        'test_lab': np.load(act_path(k, 'test_labels')),
+        'test_subj': np.load(act_path(k, 'test_subj')),
+        'tr': np.array(tr), 'te': np.array(te),
+        'n_subjects': int(len(np.unique(hc_subj))),
+    })
+
+n_subj = [f['n_subjects'] for f in fold_data]
 all_results = {
-    'bin_counts': BIN_COUNTS,
-    'layer': LAYER,
-    'per_bin': {},
-    'raw_reid': {},  # bin-independent
+    'bin_counts': BIN_COUNTS, 'layer': LAYER, 'background': BACKGROUND, 'alpha': ALPHA,
+    'pvalues': 'directed one-tailed (same as run_deepscan.py)', 'git_commit': GIT_COMMIT,
+    'attack': 'closed-set window->subject linkage, multinomial LR, 80/20 windows per subject',
+    'n_attack_subjects_per_fold': n_subj,
+    'chance_top1': float(np.mean([1 / n for n in n_subj])),
+    'chance_top5': float(np.mean([5 / n for n in n_subj])),
+    'per_bin': {}, 'raw_reid': {},
 }
 
 # First pass: raw activation re-identification (doesn't depend on bins)
-raw_top1_folds = []
-raw_top5_folds = []
-
-for fold_idx in range(C.N_SPLITS):
-    k = fold_idx + 1
-    hc_acts = np.load(osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_hc_train.npy'))
-
-    fold       = folds[fold_idx]
-    train_mask = np.isin(subject_ids, fold['train_subjects'])
-    train_lab  = labels[train_mask]
-    train_subj = subject_ids[train_mask]
-
-    hc_mask    = train_lab == 0
-    hc_subj    = train_subj[hc_mask]
-    unique_hc  = np.unique(hc_subj)
-    subj_to_idx = {s: i for i, s in enumerate(unique_hc)}
-    subj_labels = np.array([subj_to_idx[s] for s in hc_subj])
-
-    np.random.seed(RANDOM_STATE)
-    train_idx, test_idx = [], []
-    for s in unique_hc:
-        idx = np.where(hc_subj == s)[0]
-        n_test = max(1, int(len(idx) * TEST_FRAC))
-        test_sel = np.random.choice(idx, n_test, replace=False)
-        train_idx.extend(np.setdiff1d(idx, test_sel))
-        test_idx.extend(test_sel)
-
-    train_idx, test_idx = np.array(train_idx), np.array(test_idx)
-
-    scaler = StandardScaler()
-    Xtr = scaler.fit_transform(hc_acts[train_idx])
-    Xte = scaler.transform(hc_acts[test_idx])
-    y_tr, y_te = subj_labels[train_idx], subj_labels[test_idx]
-
-    clf = LogisticRegression(max_iter=1000, class_weight='balanced',
-                             C=1.0, random_state=RANDOM_STATE,
-                             multi_class='multinomial', solver='lbfgs')
-    clf.fit(Xtr, y_tr)
-    probs = clf.predict_proba(Xte)
-    raw_top1_folds.append(accuracy_score(y_te, probs.argmax(axis=1)))
-    raw_top5_folds.append(top_k_accuracy(y_te, probs, k=5))
-
-all_results['raw_reid'] = {
-    'top1_mean': float(np.mean(raw_top1_folds)),
-    'top1_std':  float(np.std(raw_top1_folds)),
-    'top5_mean': float(np.mean(raw_top5_folds)),
-    'top5_std':  float(np.std(raw_top5_folds)),
-    'per_fold_top1': [float(x) for x in raw_top1_folds],
-    'per_fold_top5': [float(x) for x in raw_top5_folds],
-}
-
-print(f"\nRaw activations (bin-independent):")
-print(f"  Top-1: {np.mean(raw_top1_folds):.4f} ± {np.std(raw_top1_folds):.4f}")
-print(f"  Top-5: {np.mean(raw_top5_folds):.4f} ± {np.std(raw_top5_folds):.4f}")
-
+raw1, raw5 = zip(*[reid_attack(f['hc_train'], f['hc_subj'], f['tr'], f['te']) for f in fold_data])
+r1, r5 = summarise(raw1), summarise(raw5)
+all_results['raw_reid'] = {'top1_mean': r1['mean'], 'top1_std': r1['std'],
+                           'top5_mean': r5['mean'], 'top5_std': r5['std'],
+                           'per_fold_top1': r1['per_fold'], 'per_fold_top5': r5['per_fold']}
+print(f"\nRaw activations: Top-1 {r1['mean']:.4f} ± {r1['std']:.4f}  "
+      f"Top-5 {r5['mean']:.4f} ± {r5['std']:.4f}  (chance Top-1 {all_results['chance_top1']:.4f})")
 
 # Second pass: per-bin analysis
 for n_bins in BIN_COUNTS:
-    print(f"\n{'='*55}")
-    print(f"N_BINS = {n_bins}")
-    print(f"{'='*55}")
+    print(f"\n{'='*55}\nN_BINS = {n_bins}\n{'='*55}")
+    p1, p5, q1, q5, aucs = [], [], [], [], []
+    for f in fold_data:
+        edges = make_global_edges(f['hc_train'], n_bins)
+        direction = f['val_pd'].mean(0) > f['hc_train'].mean(0)
+        counts = site_counts(f['bg'], edges)
 
-    pval_top1_folds = []
-    pval_top5_folds = []
-    deepscan_auc_folds = []
+        X_p = pvalues_from_counts(counts, edges, f['hc_train'], direction, ALPHA)
+        a, b = reid_attack(X_p, f['hc_subj'], f['tr'], f['te']); p1.append(a); p5.append(b)
 
-    for fold_idx in range(C.N_SPLITS):
-        k = fold_idx + 1
+        X_q = bin_index(f['hc_train'], edges).astype(float)
+        a, b = reid_attack(X_q, f['hc_subj'], f['tr'], f['te']); q1.append(a); q5.append(b)
 
-        # Load activations
-        hc_train_acts = np.load(osp.join(ACT_DIR,
-                                         f'activations_fold{k}_{LAYER}_hc_train.npy'))
+        p_test = pvalues_from_counts(counts, edges, f['test'], direction, ALPHA)
+        aucs.append(method_a_auc(p_test, f['test_subj'], f['test_lab']))
 
-        fold       = folds[fold_idx]
-        train_mask = np.isin(subject_ids, fold['train_subjects'])
-        test_mask  = np.isin(subject_ids, fold['test_subjects'])
-        train_lab  = labels[train_mask]
-        train_subj = subject_ids[train_mask]
-        test_lab   = labels[test_mask]
-        test_subj  = subject_ids[test_mask]
-
-        # HC train windows for re-identification
-        hc_mask     = train_lab == 0
-        hc_subj     = train_subj[hc_mask]
-        unique_hc   = np.unique(hc_subj)
-        subj_to_idx = {s: i for i, s in enumerate(unique_hc)}
-        subj_labels = np.array([subj_to_idx[s] for s in hc_subj])
-
-        # Re-identification: train/test split within HC train windows
-        np.random.seed(RANDOM_STATE)
-        reid_train_idx, reid_test_idx = [], []
-        for s in unique_hc:
-            idx = np.where(hc_subj == s)[0]
-            n_test = max(1, int(len(idx) * TEST_FRAC))
-            test_sel = np.random.choice(idx, n_test, replace=False)
-            reid_train_idx.extend(np.setdiff1d(idx, test_sel))
-            reid_test_idx.extend(test_sel)
-
-        reid_train_idx = np.array(reid_train_idx)
-        reid_test_idx  = np.array(reid_test_idx)
-
-        # Compute p-values with current n_bins
-        X_pval_train = compute_pvalues(hc_train_acts[reid_train_idx],
-                                        hc_train_acts[reid_train_idx], n_bins)
-        X_pval_test  = compute_pvalues(hc_train_acts[reid_train_idx],
-                                        hc_train_acts[reid_test_idx],  n_bins)
-
-        # Re-identification on p-values
-        scaler = StandardScaler()
-        Xtr = scaler.fit_transform(X_pval_train)
-        Xte = scaler.transform(X_pval_test)
-        y_tr = subj_labels[reid_train_idx]
-        y_te = subj_labels[reid_test_idx]
-
-        clf = LogisticRegression(max_iter=1000, class_weight='balanced',
-                                 C=1.0, random_state=RANDOM_STATE,
-                                 multi_class='multinomial', solver='lbfgs')
-        clf.fit(Xtr, y_tr)
-        probs = clf.predict_proba(Xte)
-        pval_top1_folds.append(accuracy_score(y_te, probs.argmax(axis=1)))
-        pval_top5_folds.append(top_k_accuracy(y_te, probs, k=5))
-
-        # DeepScan Method A: need HC test + PD test activations
-        # HC test activations
-        full_test_path   = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_test.npy')
-        test_subj_path   = osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy')
-        test_labels_path = osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy')
-
-        if osp.exists(full_test_path) and osp.exists(test_subj_path):
-            # Use the full test set and split by labels ourselves
-            full_test_path   = osp.join(ACT_DIR, f'activations_fold{k}_{LAYER}_test.npy')
-            test_subj_path   = osp.join(ACT_DIR, f'activations_fold{k}_test_subj.npy')
-            test_labels_path = osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy')
-
-            all_test_acts = np.load(full_test_path)
-            t_subj   = np.load(test_subj_path)
-            t_labels = np.load(test_labels_path)
-
-            hc_idx = (t_labels == 0)
-            pd_idx = (t_labels == 1)
-
-            hc_test_acts = all_test_acts[hc_idx]
-            pd_test_acts = all_test_acts[pd_idx]
-            hc_subj_ids  = t_subj[hc_idx]
-            pd_subj_ids  = t_subj[pd_idx]
-
-            # p-values against HC train reference
-            hc_test_pvals = compute_pvalues(hc_train_acts, hc_test_acts, n_bins)
-            pd_test_pvals = compute_pvalues(hc_train_acts, pd_test_acts, n_bins)
-
-            # Per-subject mean p-value
-            hc_scores = []
-            for s in np.unique(hc_subj_ids):
-                mask = hc_subj_ids == s
-                hc_scores.append(hc_test_pvals[mask].mean())
-
-            pd_scores = []
-            for s in np.unique(pd_subj_ids):
-                mask = pd_subj_ids == s
-                pd_scores.append(pd_test_pvals[mask].mean())
-
-            scores = np.array(hc_scores + pd_scores)
-            auc_labels = np.array([0]*len(hc_scores) + [1]*len(pd_scores))
-            auc = roc_auc_score(auc_labels, -scores)
-            deepscan_auc_folds.append(auc)
-        else:
-            print(f"  [Fold {k}] HC/PD test activations not found, skipping DeepScan")
-
-    bin_result = {
+    s_p1, s_p5, s_q1, s_q5, s_auc = map(summarise, (p1, p5, q1, q5, aucs))
+    all_results['per_bin'][str(n_bins)] = {
         'n_bins': n_bins,
-        'reid_top1_mean': float(np.mean(pval_top1_folds)),
-        'reid_top1_std':  float(np.std(pval_top1_folds)),
-        'reid_top5_mean': float(np.mean(pval_top5_folds)),
-        'reid_top5_std':  float(np.std(pval_top5_folds)),
-        'per_fold_reid_top1': [float(x) for x in pval_top1_folds],
-        'per_fold_reid_top5': [float(x) for x in pval_top5_folds],
+        'reid_top1_mean': s_p1['mean'], 'reid_top1_std': s_p1['std'],
+        'reid_top5_mean': s_p5['mean'], 'reid_top5_std': s_p5['std'],
+        'per_fold_reid_top1': s_p1['per_fold'], 'per_fold_reid_top5': s_p5['per_fold'],
+        'quant_reid_top1_mean': s_q1['mean'], 'quant_reid_top1_std': s_q1['std'],
+        'quant_reid_top5_mean': s_q5['mean'], 'quant_reid_top5_std': s_q5['std'],
+        'deepscan_auc_mean': s_auc['mean'], 'deepscan_auc_std': s_auc['std'],
+        'per_fold_deepscan_auc': s_auc['per_fold'],
     }
-
-    if deepscan_auc_folds:
-        bin_result['deepscan_auc_mean'] = float(np.mean(deepscan_auc_folds))
-        bin_result['deepscan_auc_std']  = float(np.std(deepscan_auc_folds))
-        bin_result['per_fold_deepscan_auc'] = [float(x) for x in deepscan_auc_folds]
-
-    all_results['per_bin'][str(n_bins)] = bin_result
-
-    print(f"  ReID Top-1: {np.mean(pval_top1_folds):.4f} ± {np.std(pval_top1_folds):.4f}")
-    if deepscan_auc_folds:
-        print(f"  DeepScan AUC: {np.mean(deepscan_auc_folds):.4f} ± {np.std(deepscan_auc_folds):.4f}")
+    print(f"  ReID Top-1 p-values: {s_p1['mean']:.4f} ± {s_p1['std']:.4f}  "
+          f"quantised raw: {s_q1['mean']:.4f} ± {s_q1['std']:.4f}")
+    print(f"  DeepScan AUC (Method A): {s_auc['mean']:.4f} ± {s_auc['std']:.4f}")
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
@@ -319,5 +181,5 @@ with open(out_path, 'w') as f:
 
 print(f"\n{'='*55}")
 print(f"Results saved: {out_path}")
-print("Run plot_privacy_utility.py to generate the figure.")
+print("Run plot_privacy_utility_v3.py to generate the figure.")
 print("DONE.")

@@ -1,5 +1,5 @@
 import numpy as np
-from sklearn.metrics import roc_auc_score, confusion_matrix, balanced_accuracy_score
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, balanced_accuracy_score
 
 def compute_metrics(y_true, y_scores, threshold=None):
     auc = roc_auc_score(y_true, y_scores)
@@ -17,6 +17,40 @@ def compute_metrics(y_true, y_scores, threshold=None):
         'balanced_acc': round(balanced_acc, 4),
         'threshold':    round(float(threshold), 6),
     }
+
+def spec_at_sens(y_true, y_scores, target_sens=0.9):
+    """Specificity at the highest threshold reaching target_sens (screening operating point)."""
+    fpr, tpr, _ = roc_curve(y_true, y_scores)
+    return round(float(1.0 - fpr[np.argmax(tpr >= target_sens)]), 4)
+
+def bootstrap_auc_ci(y_true, y_scores, n_boot=2000, alpha=0.05, seed=42):
+    """Subject-level percentile bootstrap CI for AUC (resample subjects with replacement)."""
+    y_true, y_scores = np.asarray(y_true), np.asarray(y_scores)
+    rng, aucs = np.random.RandomState(seed), []
+    for _ in range(n_boot):
+        idx = rng.randint(0, len(y_true), len(y_true))
+        if len(np.unique(y_true[idx])) < 2:
+            continue
+        aucs.append(roc_auc_score(y_true[idx], y_scores[idx]))
+    lo, hi = np.percentile(aucs, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return {'auc': round(float(roc_auc_score(y_true, y_scores)), 4),
+            'ci_low': round(float(lo), 4), 'ci_high': round(float(hi), 4)}
+
+def paired_bootstrap_auc_diff(y_true, scores_a, scores_b, n_boot=2000, seed=42):
+    """Paired bootstrap of AUC(a) - AUC(b) on the same subjects. Returns diff, 95% CI, p (two-sided)."""
+    y_true, a, b = np.asarray(y_true), np.asarray(scores_a), np.asarray(scores_b)
+    rng, diffs = np.random.RandomState(seed), []
+    for _ in range(n_boot):
+        idx = rng.randint(0, len(y_true), len(y_true))
+        if len(np.unique(y_true[idx])) < 2:
+            continue
+        diffs.append(roc_auc_score(y_true[idx], a[idx]) - roc_auc_score(y_true[idx], b[idx]))
+    diffs = np.array(diffs)
+    p = 2 * min((diffs <= 0).mean(), (diffs >= 0).mean())
+    return {'diff': round(float(roc_auc_score(y_true, a) - roc_auc_score(y_true, b)), 4),
+            'ci_low': round(float(np.percentile(diffs, 2.5)), 4),
+            'ci_high': round(float(np.percentile(diffs, 97.5)), 4),
+            'p': round(float(min(p, 1.0)), 4)}
 
 def aggregate_fold_metrics(fold_metrics):
     keys = ['auc', 'sensitivity', 'specificity', 'balanced_acc']
