@@ -25,7 +25,7 @@ Run:
     python scripts/run_deepscan.py
 """
 
-import sys, os, os.path as osp, json, subprocess, warnings
+import sys, os, os.path as osp, json, subprocess, warnings, zlib
 warnings.filterwarnings('ignore')
 
 import numpy as np
@@ -74,6 +74,7 @@ N_BINS     = int(os.environ.get('N_BINS', 10))   # NOTE: select on validation, n
 ALPHA      = 1.0     # Laplace (add-one) smoothing
 A_MAX      = 0.5
 RESTARTS   = 5
+GROUP_SEED = int(os.environ.get('GROUP_SEED', 0))   # Method C random restarts (see safe_group_score)
 BACKGROUND = os.environ.get('BACKGROUND', 'val_hc')  # 'val_hc' (held-out) or 'hc_train' (original)
 EVAL_TASK  = os.environ.get('EVAL_TASK') or None     # e.g. 'relaxed' — substring match; None = all
 EVAL_WRIST = os.environ.get('EVAL_WRIST') or None    # e.g. 'right'   — substring match; None = both
@@ -87,6 +88,7 @@ try:
 except Exception:
     GIT_COMMIT = 'unknown'
 RUN_CONFIG = {'n_bins': N_BINS, 'alpha': ALPHA, 'a_max': A_MAX, 'restarts': RESTARTS,
+              'group_seed': GROUP_SEED,
               'background': BACKGROUND, 'edges_from': 'hc_train', 'direction_source': 'val_pd vs hc_train',
               'eval_task': EVAL_TASK, 'eval_wrist': EVAL_WRIST, 'run_tag': RUN_TAG,
               'git_commit': GIT_COMMIT}
@@ -133,7 +135,12 @@ def safe_individ_score(pvals_1d, a_max=A_MAX, score_fn=None):
         return np.nan
 
 
-def safe_group_score(p_subj_2d, a_max=A_MAX, restarts=RESTARTS, score_fn=None):
+def safe_group_score(p_subj_2d, a_max=A_MAX, restarts=RESTARTS, score_fn=None, seed=None):
+    # fgss_for_nets: restart 0 starts from all nodes (deterministic); restarts 1..n-1 start
+    # from a random node subset drawn with the GLOBAL np.random, which ART never seeds.
+    # Seeding per subject makes Method C reproducible and independent of scoring order.
+    if seed is not None:
+        np.random.seed(seed)
     try:
         p_3d = np.stack([p_subj_2d, p_subj_2d], axis=2).astype(np.float64)
         best_score, image_sub, node_sub, _ = Scanner.fgss_for_nets(
@@ -154,8 +161,10 @@ def subject_scores(p_matrix, subj, method, score_fn=None):
         win = np.array([safe_individ_score(p, score_fn=score_fn) for p in p_matrix])
         return unique_subj, np.array([np.nanmean(win[subj == s]) for s in unique_subj])
     if method == 'group':
-        return unique_subj, np.array([safe_group_score(p_matrix[subj == s], score_fn=score_fn)[0]
-                                      for s in unique_subj])
+        return unique_subj, np.array([
+            safe_group_score(p_matrix[subj == s], score_fn=score_fn,
+                             seed=zlib.crc32(f'{GROUP_SEED}-{s}'.encode()))[0]
+            for s in unique_subj])
     raise ValueError(method)
 
 
@@ -179,6 +188,7 @@ for layer in LAYERS_TO_SCAN:
     print(f"{'#'*60}")
 
     RESULTS_FILE = osp.join(C.RESULTS_DIR, f'deepscan_results_{layer}{RUN_TAG}.json')
+    FGSS_FAILURES.update({key: 0 for key in FGSS_FAILURES})   # counts are per layer
     per_fold = {m: [] for m in METHODS}
     dd_per_fold = []
     # Pooled subject scores across folds, for bootstrap CIs / paired tests
@@ -289,7 +299,7 @@ for layer in LAYERS_TO_SCAN:
                   round(float(np.std([d[key] for d in dd_per_fold])), 4)]
             for key in ['auc_hc_vs_dd', 'auc_hc_vs_pd_dd']}
         print(f"DD summary (mean, std): {layer_result['aggregate_dd']}")
-    print(f"FGSS failures so far: {FGSS_FAILURES}")
+    print(f"FGSS failures (this layer): {FGSS_FAILURES}")
 
     all_results[layer] = layer_result
     with open(RESULTS_FILE, 'w') as f:
