@@ -16,6 +16,8 @@ def compute_metrics(y_true, y_scores, threshold=None):
         'specificity':  round(specificity, 4),
         'balanced_acc': round(balanced_acc, 4),
         'threshold':    round(float(threshold), 6),
+        # Threshold-free screening operating point (the median-threshold sens/spec above are not)
+        'spec_at_90sens': spec_at_sens(y_true, y_scores, 0.9),
     }
 
 def spec_at_sens(y_true, y_scores, target_sens=0.9):
@@ -53,9 +55,11 @@ def paired_bootstrap_auc_diff(y_true, scores_a, scores_b, n_boot=2000, seed=42):
             'p': round(float(min(p, 1.0)), 4)}
 
 def aggregate_fold_metrics(fold_metrics):
-    keys = ['auc', 'sensitivity', 'specificity', 'balanced_acc']
+    keys = ['auc', 'sensitivity', 'specificity', 'balanced_acc', 'spec_at_90sens']
     result = {}
     for k in keys:
+        if not all(k in m for m in fold_metrics):
+            continue
         values = [m[k] for m in fold_metrics]
         result[f'{k}_mean'] = round(float(np.mean(values)), 4)
         result[f'{k}_std']  = round(float(np.std(values)), 4)
@@ -69,3 +73,5 @@ def print_summary(agg):
     print(f"Mean Sensitivity:  {agg['sensitivity_mean']:.4f} ± {agg['sensitivity_std']:.4f}")
     print(f"Mean Specificity:  {agg['specificity_mean']:.4f} ± {agg['specificity_std']:.4f}")
     print(f"Mean Balanced Acc: {agg['balanced_acc_mean']:.4f} ± {agg['balanced_acc_std']:.4f}")
+    if 'spec_at_90sens_mean' in agg:
+        print(f"Spec @ 90% sens:   {agg['spec_at_90sens_mean']:.4f} ± {agg['spec_at_90sens_std']:.4f}")

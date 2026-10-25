@@ -17,9 +17,8 @@ For each fold saves (per layer):
   activations_fold{k}_{layer}_test.npy      — all test windows (n_test, 128)
   activations_fold{k}_{layer}_test_labels.npy
   activations_fold{k}_{layer}_test_subj.npy
-  activations_fold{k}_{layer}_dd.npy        — all DD subjects (never in any fold)
   activations_fold{k}_{split}_{subj,task,wrist}.npy — per-window metadata,
-        split in {hc_train, val_hc, val_pd, test, dd} (test_subj saved as before)
+        split in {hc_train, val_hc, val_pd, test} (test_subj saved as before)
   activations_fold{k}_norm_mean.npy
   activations_fold{k}_norm_std.npy
 
@@ -112,10 +111,6 @@ PD_STR = next(l for l in all_labels_found if 'parkinson' in l.lower() or l == 'P
 LABEL_MAP = {HC_STR: 0, PD_STR: 1}
 print(f'HC="{HC_STR}"  PD="{PD_STR}"')
 
-DD_STRS = [l for l in all_labels_found if l not in (HC_STR, PD_STR)]
-print(f'Other (DD) labels: {DD_STRS}  '
-      f'subjects: {manifest[manifest["label"].isin(DD_STRS)]["patient_id"].nunique()}')
-
 def window_recordings(df, label_of):
     """Window every recording in df. Returns windows, labels, subject_ids, tasks, wrists."""
     all_windows, all_labels_out, all_subject_ids = [], [], []
@@ -143,19 +138,13 @@ def window_recordings(df, label_of):
             np.array(all_tasks), np.array(all_wrists))
 
 filtered = manifest[manifest['label'].isin([HC_STR, PD_STR])].copy()
-dd_rows  = manifest[manifest['label'].isin(DD_STRS)].copy()
 if C.TRAIN_WRIST is not None:
     filtered = filtered[filtered['wrist'] == C.TRAIN_WRIST]
-    dd_rows  = dd_rows[dd_rows['wrist'] == C.TRAIN_WRIST]
 print(f'Subjects: {filtered["patient_id"].nunique()}  Rows: {len(filtered)}')
 
 print("Windowing HC/PD...")
 windows, labels, subject_ids, tasks, wrists = window_recordings(filtered, LABEL_MAP.get)
 print(f"  HC={(labels==0).sum()}  PD={(labels==1).sum()}")
-
-# DD subjects are never in any fold: every fold's model scores all of them
-print("Windowing DD...")
-dd_windows, _, dd_subj, dd_task, dd_wrist = window_recordings(dd_rows, lambda _: 2)
 
 unique_subjects = np.unique(subject_ids)
 subject_labels  = np.array([labels[subject_ids == s][0] for s in unique_subjects])
@@ -251,7 +240,7 @@ for fold_idx, fold in enumerate(folds):
 
     # Skip if already extracted for both layers (incl. metadata added for federated sim)
     files_needed = [f'activations_fold{k}_{layer}_hc_train.npy' for layer in LAYERS_TO_EXTRACT]
-    files_needed.append(f'activations_fold{k}_dd_subj.npy')
+    files_needed.append(f'activations_fold{k}_hc_train_subj.npy')
     if not FORCE_REEXTRACT and all(osp.exists(osp.join(ACT_DIR, f)) for f in files_needed):
         print(f"Already extracted — skipping fold {k}")
         continue
@@ -272,7 +261,6 @@ for fold_idx, fold in enumerate(folds):
     train_win = apply_normalization(train_win, mean, std)
     val_win   = apply_normalization(val_win,   mean, std)
     test_win  = apply_normalization(test_win,  mean, std)
-    dd_win    = apply_normalization(dd_windows, mean, std)
 
     hc_train_win = train_win[train_lab == 0]
     val_hc_win   = val_win[val_lab == 0]
@@ -302,9 +290,6 @@ for fold_idx, fold in enumerate(folds):
     print("Extracting test activations...")
     test_acts = extract_acts(model, test_win, test_lab)
 
-    print("Extracting DD activations...")
-    dd_acts = extract_acts(model, dd_win, np.zeros(len(dd_win), dtype=np.int64))
-
     # Save for each layer
     for layer in LAYERS_TO_EXTRACT:
         print(f"  Saving {layer}: {hc_train_acts[layer].shape}")
@@ -316,8 +301,6 @@ for fold_idx, fold in enumerate(folds):
                 val_pd_acts[layer])
         np.save(osp.join(ACT_DIR, f'activations_fold{k}_{layer}_test.npy'),
                 test_acts[layer])
-        np.save(osp.join(ACT_DIR, f'activations_fold{k}_{layer}_dd.npy'),
-                dd_acts[layer])
 
     # Shared files (same for both layers)
     np.save(osp.join(ACT_DIR, f'activations_fold{k}_test_labels.npy'), test_lab)
@@ -327,8 +310,7 @@ for fold_idx, fold in enumerate(folds):
     meta = {'hc_train': (train_subj[hc_tr], train_task[hc_tr], train_wrist[hc_tr]),
             'val_hc':   (val_subj[v_hc],    val_task[v_hc],    val_wrist[v_hc]),
             'val_pd':   (val_subj[v_pd],    val_task[v_pd],    val_wrist[v_pd]),
-            'test':     (test_subj,         test_task,         test_wrist),
-            'dd':       (dd_subj,           dd_task,           dd_wrist)}
+            'test':     (test_subj,         test_task,         test_wrist)}
     for split, (s, t, w) in meta.items():
         if split != 'test':
             np.save(osp.join(ACT_DIR, f'activations_fold{k}_{split}_subj.npy'), s)

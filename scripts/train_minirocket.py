@@ -151,7 +151,7 @@ for fold_idx, fold in enumerate(folds):
     pd_idx = np.where(train_lab == 1)[0]
     hc_os  = resample(hc_idx, replace=True, n_samples=len(pd_idx), random_state=C.RANDOM_STATE)
     idx    = np.concatenate([hc_os, pd_idx])
-    np.random.shuffle(idx)
+    np.random.RandomState(C.RANDOM_STATE + fold_idx).shuffle(idx)   # seeded: retrain is reproducible
     train_win, train_lab = train_win[idx], train_lab[idx]
 
     print(f"Train: {train_win.shape[0]:,}  HC={(train_lab==0).sum():,}  PD={(train_lab==1).sum():,}")

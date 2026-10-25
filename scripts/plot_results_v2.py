@@ -82,11 +82,12 @@ if r:
         fpr, tpr, _ = roc_curve(y[keep], sc[keep])
         ci = r[f'aggregate_{m}']['pooled_bootstrap']
         ax.plot(fpr, tpr, color=SERIES[i],
-                label=f"{label}  {ci['auc']:.2f} [{ci['ci_low']:.2f}, {ci['ci_high']:.2f}]")
+                label=f"{label.split(':')[0]}  {ci['auc']:.2f} [{ci['ci_low']:.2f}, {ci['ci_high']:.2f}]")
     ax.set_xlabel('False positive rate (1 − specificity)')
     ax.set_ylabel('True positive rate (sensitivity)')
     ax.set_xlim(0, 1); ax.set_ylim(0, 1.01); ax.set_aspect('equal')
-    ax.legend(loc='lower right', title='Pooled AUC [95% CI]', title_fontsize=8)
+    # Short labels keep the legend in the empty lower-right corner, clear of the curves
+    ax.legend(loc='lower right', title='Method: pooled AUC [95% CI]', title_fontsize=8)
     save(fig, 'fig_roc_layer2')
 
 # ── Fig: Method AUC with CI per configuration ─────────────────────────────────
@@ -143,8 +144,7 @@ if r:
     ax.set_xticks(sizes)
     ax.set_xlabel('Healthy-control subjects per site')
     ax.set_ylabel('Membership-inference AUC')
-    ax.set_ylim(0.35, 1.02); ax.set_xlim(sizes[0] - 2, sizes[-1] + 6)
-    ax.legend(loc='upper right')
+    ax.set_ylim(0.35, 1.02); ax.set_xlim(sizes[0] - 2, sizes[-1] + 6)   # direct labels, no legend
     save(fig, 'fig_membership')
 
 # ── Fig: re-identification vs bins ────────────────────────────────────────────

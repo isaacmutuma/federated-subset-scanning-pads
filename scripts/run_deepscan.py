@@ -19,8 +19,6 @@ Three scoring methods per layer:
   C) Group FGSS per subject (fgss_for_nets — SubsetGAN approach)
      pvalues shape: (n_windows, n_neurons, 2)
 
-If DD activations exist, DD subjects are also scored (HC vs DD, HC vs PD+DD).
-
 Run:
     python scripts/run_deepscan.py
 """
@@ -190,7 +188,6 @@ for layer in LAYERS_TO_SCAN:
     RESULTS_FILE = osp.join(C.RESULTS_DIR, f'deepscan_results_{layer}{RUN_TAG}.json')
     FGSS_FAILURES.update({key: 0 for key in FGSS_FAILURES})   # counts are per layer
     per_fold = {m: [] for m in METHODS}
-    dd_per_fold = []
     # Pooled subject scores across folds, for bootstrap CIs / paired tests
     pooled = {'subj': [], 'label': [], 'fold': [], **{m: [] for m in METHODS}}
     score_fn = ScoringFunctions.get_score_bj_fast if ART_AVAILABLE else None
@@ -234,38 +231,16 @@ for layer in LAYERS_TO_SCAN:
         pooled['label'].extend(subj_true.tolist())
         pooled['fold'].extend([k] * len(unique_subj))
 
-        fold_scores = {}
         for method in METHODS:
             _, scores = subject_scores(p_matrix, test_subj, method, score_fn)
-            fold_scores[method] = scores
             pooled[method].extend(scores.tolist())
             m = fold_metrics(subj_true, scores)
             per_fold[method].append(m)
             print(f"{METHOD_LABELS[method]} — ", end=""); print_fold_results(fold_idx, m)
 
-        # DD subjects: scored with Method A against the same reference
-        dd_path = act_path(k, f'{layer}_dd')
-        if osp.exists(dd_path):
-            dd_acts = np.load(dd_path)
-            dd_subj = np.load(act_path(k, 'dd_subj'))
-            m_dd = eval_mask(k, 'dd', len(dd_acts))
-            p_dd = pvalues_from_counts(ref_counts, edges, dd_acts[m_dd], direction_mask, ALPHA)
-            _, dd_scores = subject_scores(p_dd, dd_subj[m_dd], 'mean')
-            hc_scores = fold_scores['mean'][subj_true == 0]
-            pd_scores = fold_scores['mean'][subj_true == 1]
-            y_hc_dd = np.r_[np.zeros(len(hc_scores)), np.ones(len(dd_scores))]
-            y_hc_any = np.r_[np.zeros(len(hc_scores)), np.ones(len(pd_scores) + len(dd_scores))]
-            dd_m = {'auc_hc_vs_dd': fold_metrics(y_hc_dd, np.r_[hc_scores, dd_scores])['auc'],
-                    'auc_hc_vs_pd_dd': fold_metrics(
-                        y_hc_any, np.r_[hc_scores, pd_scores, dd_scores])['auc'],
-                    'n_dd_subjects': int(len(dd_scores))}
-            dd_per_fold.append(dd_m)
-            print(f"DD (Method A) — HC vs DD AUC: {dd_m['auc_hc_vs_dd']:.4f}  "
-                  f"HC vs PD+DD AUC: {dd_m['auc_hc_vs_pd_dd']:.4f}")
-
         with open(RESULTS_FILE, 'w') as f:
             json.dump({'layer': layer, 'config': RUN_CONFIG, 'folds_complete': k,
-                       'fold_metrics': per_fold, 'dd_fold_metrics': dd_per_fold}, f, indent=2)
+                       'fold_metrics': per_fold}, f, indent=2)
 
     # Summary for this layer
     print(f"\n{'='*55}")
@@ -273,19 +248,16 @@ for layer in LAYERS_TO_SCAN:
     print(f"{'='*55}")
     y_pool = np.array(pooled['label'])
     layer_result = {'config': RUN_CONFIG, 'fgss_failures': dict(FGSS_FAILURES),
-                    'fold_metrics': per_fold, 'dd_fold_metrics': dd_per_fold,
+                    'fold_metrics': per_fold,
                     'subject_scores': pooled}
     for method in METHODS:
         print(f"\n{METHOD_LABELS[method]}")
-        agg = aggregate_fold_metrics(per_fold[method])
-        agg['spec_at_90sens_mean'] = round(float(np.mean(
-            [m['spec_at_90sens'] for m in per_fold[method]])), 4)
+        agg = aggregate_fold_metrics(per_fold[method])   # includes spec_at_90sens mean/std
         s = np.array(pooled[method])
         keep = ~np.isnan(s)
         # Pooled across folds: Method A scores share a scale; FGSS scores may not
         agg['pooled_bootstrap'] = bootstrap_auc_ci(y_pool[keep], s[keep])
         print_summary(agg)
-        print(f"Spec @ 90% sens:   {agg['spec_at_90sens_mean']:.4f}")
         print(f"Pooled AUC 95% CI: {agg['pooled_bootstrap']}")
         layer_result[f'aggregate_{method}'] = agg
     if 'group' in METHODS:
@@ -293,12 +265,6 @@ for layer in LAYERS_TO_SCAN:
         keep = ~(np.isnan(a) | np.isnan(c))
         layer_result['paired_A_vs_C'] = paired_bootstrap_auc_diff(y_pool[keep], a[keep], c[keep])
         print(f"\nPaired A vs C (pooled): {layer_result['paired_A_vs_C']}")
-    if dd_per_fold:
-        layer_result['aggregate_dd'] = {
-            key: [round(float(np.mean([d[key] for d in dd_per_fold])), 4),
-                  round(float(np.std([d[key] for d in dd_per_fold])), 4)]
-            for key in ['auc_hc_vs_dd', 'auc_hc_vs_pd_dd']}
-        print(f"DD summary (mean, std): {layer_result['aggregate_dd']}")
     print(f"FGSS failures (this layer): {FGSS_FAILURES}")
 
     all_results[layer] = layer_result
