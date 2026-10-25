@@ -37,10 +37,10 @@ os.chdir(C.REPO_DIR)
 
 from src.scanning.histograms import make_global_edges, site_counts, pvalues_from_counts, bin_index
 
-ACT_DIR = osp.join(C.RESULTS_DIR, 'activations')
+ACT_DIR = os.environ.get('ACT_DIR', osp.join(C.RESULTS_DIR, 'activations'))
 assert osp.exists(ACT_DIR), f"Run extract_activations.py first. Not found: {ACT_DIR}"
 
-LAYER      = 'layer_2'
+LAYER      = os.environ.get('LAYER', 'layer_2')
 N_BINS     = 10
 ALPHA      = 1.0
 BACKGROUND = 'val_hc'

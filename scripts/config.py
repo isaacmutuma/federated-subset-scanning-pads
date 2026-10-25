@@ -44,6 +44,9 @@ elif ENV == 'local':
 else:
     raise ValueError(f"Unknown ENV: {ENV}. Must be 'colab', 'kaggle', or 'local'.")
 
+# Side pipelines (e.g. minirocket_scan/) point the shared analysis scripts at their own folder
+RESULTS_DIR = os.environ.get('RESULTS_DIR', RESULTS_DIR)
+
 # ── Model hyperparameters (never change these without updating memory) ─────────
 D_MODEL      = 128
 NUM_HEADS    = 8

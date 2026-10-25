@@ -62,7 +62,7 @@ except ImportError:
         ART_AVAILABLE = False
         print("ART not available.")
 
-ACT_DIR = osp.join(C.RESULTS_DIR, 'activations')
+ACT_DIR = os.environ.get('ACT_DIR', osp.join(C.RESULTS_DIR, 'activations'))
 assert osp.exists(ACT_DIR), f"Run extract_activations.py first. Not found: {ACT_DIR}"
 os.makedirs(C.RESULTS_DIR, exist_ok=True)
 
@@ -78,7 +78,7 @@ EVAL_TASK  = os.environ.get('EVAL_TASK') or None     # e.g. 'relaxed' — substr
 EVAL_WRIST = os.environ.get('EVAL_WRIST') or None    # e.g. 'right'   — substring match; None = both
 RUN_TAG    = os.environ.get('RUN_TAG', '')           # suffix for result files of variant runs
 
-LAYERS_TO_SCAN = ['layer_0', 'layer_1', 'layer_2']
+LAYERS_TO_SCAN = os.environ.get('LAYERS', 'layer_0,layer_1,layer_2').split(',')
 
 try:
     GIT_COMMIT = subprocess.check_output(['git', '-C', C.REPO_DIR, 'rev-parse', 'HEAD'],

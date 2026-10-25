@@ -41,10 +41,10 @@ from src.training.metrics import compute_metrics
 from src.scanning.histograms import (make_global_edges, site_counts, merge_counts,
                                      pvalues_from_counts)
 
-ACT_DIR = osp.join(C.RESULTS_DIR, 'activations')
+ACT_DIR = os.environ.get('ACT_DIR', osp.join(C.RESULTS_DIR, 'activations'))
 assert osp.exists(ACT_DIR), f"Run extract_activations.py first. Not found: {ACT_DIR}"
 
-LAYER      = 'layer_2'
+LAYER      = os.environ.get('LAYER', 'layer_2')
 N_BINS     = 10
 ALPHA      = 1.0
 N_SITES    = 3
