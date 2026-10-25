@@ -111,13 +111,21 @@ def eval_mask(k, split, n):
     return mask
 
 
-# ── FGSS wrappers: failures are counted, not silently scored as normal ────────
-FGSS_FAILURES = {'individ': 0, 'group': 0}
+# ── FGSS wrappers: real failures are counted, not silently scored as normal ───
+# fgss_individ_for_nets expects pvalues of shape (n_nodes, 2) = [pmin, pmax] per node
+# and reads pmax from column 1. (Earlier versions passed shape (1, n_nodes), so only
+# node 1's p-value was scanned.) A window with no p-value <= a_max has no candidate
+# subset: ART raises on the empty search, but the correct scan score is 0
+# ("nothing anomalous"), so it is scored 0 and counted separately from genuine errors.
+FGSS_FAILURES = {'individ': 0, 'group': 0, 'individ_empty_subset': 0}
 
 def safe_individ_score(pvals_1d, a_max=A_MAX, score_fn=None):
+    if pvals_1d.min() > a_max:
+        FGSS_FAILURES['individ_empty_subset'] += 1
+        return 0.0
     try:
         score, _, _, _ = Scanner.fgss_individ_for_nets(
-            pvalues=pvals_1d.reshape(1, -1).astype(np.float64),
+            pvalues=np.stack([pvals_1d, pvals_1d], axis=1).astype(np.float64),
             a_max=a_max, score_function=score_fn)
         return float(score)
     except Exception:
