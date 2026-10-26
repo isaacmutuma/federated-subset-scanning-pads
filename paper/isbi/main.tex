@@ -1,0 +1,171 @@
+% Template for ISBI paper; to be used with:
+%          spconf.sty  - ICASSP/ICIP LaTeX style file, and
+%          IEEEbib.bst - IEEE bibliography style file.
+% --------------------------------------------------------------------------
+% Every number in this file comes from the corrected pipeline (commit e21f988, notebooks/
+% 000_full_pipeline.ipynb) or the MiniROCKET side run (commit 733f1c7), and matches the
+% shared working doc. Figure files: RESULTS_DIR/figures_shared_doc/ (scripts/plot_shared_doc_figures.py).
+% Anonymise names, affiliations and the repository link before submitting to a double-blind venue.
+\documentclass{article}
+\usepackage{spconf,amsmath,graphicx}
+\usepackage{enumitem}
+\setlist{nosep, leftmargin=14pt}
+
+\def\x{{\mathbf x}}
+\def\L{{\cal L}}
+\input{format}
+
+\title{Federated Subset Scanning for Movement Disorder Detection}
+\name{Isaac Mutuma$^{1}$, Tanya Akumu$^{2}$, Celia Cintas$^{3}$}
+\address{$^{1}$Pusan National University, South Korea \quad
+$^{2}$Universitat de Barcelona, Spain \quad
+$^{3}$IBM Research Africa}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Kenya has fewer than 20 neurologists for about 56 million people, so Parkinson's disease (PD) often goes unrecognised. We study a smartwatch screen in which an encoder is trained once, healthy volunteers contribute only histogram counts of its internal activations to build a healthy reference, and each patient's watch scores its wearer locally against that reference. On the PADS dataset (355 subjects, 5-fold subject-level cross-validation), histogram-based subset scanning of PatchTST activations separates PD from healthy controls with AUC $0.860 \pm 0.067$ (pooled $0.854$, 95\% CI $[0.804, 0.899]$) with no labels at the scoring stage, against $0.904$ for the supervised classifier. Mean-p-value, per-window and group subset scans are statistically tied, and compressed-input baselines that skip the encoder fall below chance. With centrally fixed bin edges, summed counts reproduce the central reference exactly. The shared histograms are not private by themselves: a membership attack identifies contributors with AUC $0.94$ for histograms of five volunteers. Laplace noise with $\varepsilon = 1$ removes this leakage without changing detection.
+\end{abstract}
+
+\begin{keywords}
+Parkinson's disease, subset scanning, wearable sensors, differential privacy, anomaly detection
+\end{keywords}
+
+\section{Introduction}
+\label{sec:intro}
+
+Kenya has fewer than 20 neurologists for about 56.4 million people~\cite{sokhi2023kenya, worldbank2024kenya}, and Parkinson's disease (PD) there is often misdiagnosed or left undiagnosed~\cite{fothergill2021kenya}. Wrist-worn inertial sensors can capture motor symptoms continuously~\cite{cox2024devices}, and supervised models reach high accuracy on smartwatch data~\cite{varghese2024pads}. Deploying such a screen, however, raises two problems: confirmed PD labels are scarce where the screen is needed, and intermediate model representations can leak information about the people who produced them~\cite{hitaj2017gan, dai2025stealing}.
+
+We study the following deployment. A PatchTST encoder~\cite{nie2023patchtst} is trained once, centrally, on labelled PD and healthy-control (HC) data, and the bin edges of a per-neuron histogram are fixed at the same time. Healthy volunteers contribute only integer histogram counts of the encoder's activations ($128 \times 10$ counts, about 5\,KB); the server sums them into a healthy reference and installs it on each monitored patient's watch, which scores its wearer locally and flags unusual movement for a clinician. Patient data never leave the watch; the privacy question concerns the volunteers. Detection uses histogram-based subset scanning~\cite{akumu2023deepscan}, which replaces stored background activations with per-neuron histograms but has so far been validated only on static inputs in a single centrally held dataset.
+
+Our contributions are: (1)~an evaluation of histogram-based subset scanning for subject-level PD detection from continuous IMU time series, with three scoring methods, supervised and compressed-input baselines, and confidence intervals; (2)~a merged-reference experiment showing that summed counts under fixed bin edges reproduce the central reference exactly; (3)~a privacy analysis of the shared histograms showing that they leak membership and that Laplace noise removes this leakage at no detection cost, and that the re-identification benefit of histograms comes from binning alone; and (4)~evidence that the trained encoder, not the classifier's accuracy, determines how well scanning works.
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{PD detection from wearables.} Varghese et al.~\cite{varghese2024pads} introduced PADS and reported, for PD vs.\ HC under nested cross-validation, 78.99\% balanced accuracy from movement data alone and 91.16\% when smartwatch data are stacked with non-motor questionnaires. These supervised pipelines require labelled data and centralised training.
+
+\textbf{Subset scanning.} Subset scanning detects anomalous patterns in neural network activations by searching for the subset of nodes whose empirical p-values are jointly most extreme under a background distribution~\cite{mcfowland2013fgss, speakman2018subset}; it has been applied to adversarial and out-of-distribution inputs~\cite{cintas2020detecting, akinwande2020audio}, and group-based variants scan subsets of inputs and nodes jointly~\cite{cintas2022group}. Akumu et al.~\cite{akumu2023deepscan} replaced stored background activations with per-node histograms, reducing memory by about 30\% and runtime by up to $4\times$.
+
+\textbf{Privacy of aggregates.} Aggregate statistics can reveal whether an individual contributed to them~\cite{homer2008resolving, shokri2017membership}; differential privacy bounds this by adding calibrated noise~\cite{dwork2006calibrating}. Federated learning shares model updates rather than data~\cite{antunes2022fl}, but updates and activations can still leak~\cite{hitaj2017gan, dai2025stealing}. We measure what shared activation histograms reveal and how much noise is needed.
+
+\section{Methods}
+\label{sec:methods}
+
+\textbf{Encoder and activations.} PatchTST~\cite{nie2023patchtst} ($d_{\text{model}}{=}128$, 8 heads, 3 layers, patch length 16, stride 8, 24 patches per channel) is trained on labelled 2-s windows. At scoring time only the frozen encoder is used. For each window, the output of transformer layer~2 is mean-pooled over channels and patches into $\mathbf{a} \in \mathbb{R}^{128}$.
+
+\textbf{Healthy reference.} For each neuron $j$, the server fixes $N{=}10$ equal-width bins spanning the training HC activations, with open-ended outer bins so that out-of-range values fall into the extreme bins. A reference is the count matrix $c_{j,b}$ of held-out HC windows under these edges. Because the edges are shared, counts from any number of contributors can be summed exactly.
+
+\textbf{P-values.} For a test activation $a_j$ falling in bin $b$, the one-tailed p-value is the add-one-smoothed share of healthy windows at least as extreme:
+\begin{equation}
+p_j = \frac{\sum_{b' \geq b} c_{j,b'} + (N - b + 1)}{\sum_{b'} c_{j,b'} + N},
+\end{equation}
+with the inequality reversed for neurons whose activation falls in PD. The direction of each neuron is set from validation PD vs.\ training HC, never from test data. A low p-value means that neuron looks unlike healthy movement.
+
+\textbf{Scoring.} Each window yields 128 p-values; a subject yields 110 windows.
+\emph{Method~A} (mean p-value) scores a window by $1 - \bar{p}$ and a subject by the mean over windows; it suits a mild shift spread across many neurons.
+\emph{Method~B} (per-window subset scan) finds, in each window, the subset $S$ of neurons and threshold $\alpha \leq 0.5$ maximising the Berk--Jones statistic $|S| \cdot \mathrm{KL}\!\left(N_\alpha(S)/|S| \,\|\, \alpha\right)$, where $N_\alpha(S)$ counts p-values in $S$ below $\alpha$~\cite{mcfowland2013fgss}; the subject score is the mean over windows. It suits anomalies that appear in scattered, independent windows.
+\emph{Method~C} (group subset scan) maximises the same statistic jointly over subsets of a subject's windows and neurons~\cite{cintas2022group} (5 restarts, seeded per subject), rewarding neurons whose p-values stay low across many windows.
+
+\textbf{Privacy evaluation.} \emph{Membership inference:} given a released histogram of $k$ volunteers and a target's windows, the attacker computes the average log-likelihood ratio of the target's bins under the released histogram and under a population histogram built from disjoint HC subjects~\cite{homer2008resolving}; membership AUC~0.5 means no leakage. \emph{Defence:} each volunteer contributes at most 10 windows and Laplace noise of scale $128 \cdot 10/\varepsilon$ is added to every count, which gives subject-level $\varepsilon$-differential privacy per release~\cite{dwork2006calibrating}. \emph{Re-identification:} a multinomial logistic regression trained on 80\% of each HC subject's windows predicts the subject of the remaining 20\% (closed set of 50--51 subjects, chance 2.0\%), from raw activations, from p-values, and from activations quantised into the same bins.
+
+\section{Experimental Setup}
+\label{sec:experiments}
+
+\textbf{Data.} PADS~\cite{varghese2024pads} contains bilateral Apple Watch Series~4 recordings (3-axis accelerometer and gyroscope, 100\,Hz) of 469 participants performing 11 tasks: 276 PD, 79 HC and 114 with other movement disorders, who are not used. Signals are band-pass filtered (1--20\,Hz) and cut into five non-overlapping 2-s windows per recording, giving 110 windows per subject and 39{,}050 windows from 355 subjects; all tasks and both wrists are used.
+
+\textbf{Evaluation.} Five-fold cross-validation, stratified by label and split by subject (per fold: 227 training, 57 validation, 71 test subjects). Per-channel normalisation uses training statistics only; HC windows are oversampled during training. We report subject-level AUC (mean $\pm$ SD over folds), the pooled AUC over all 355 test subjects with a bootstrap 95\% CI, a paired bootstrap test between methods, and specificity at 90\% sensitivity.
+
+\textbf{Baselines.} Supervised classifiers: MiniROCKET~\cite{dempster2021minirocket} (sktime, 1{,}000 kernels, ridge classifier), InceptionTime~\cite{ismail2020inceptiontime}, BOSS with an SGD classifier~\cite{schafer2015boss}, and the PatchTST classifier itself. Compressed-input baselines score mean-pooled segments (60 dims), statistical features (30) and PCA (60) of the raw window with Method~A, without the encoder.
+
+\textbf{Merged reference.} The 63 HC subjects per fold (validation and training) are split into 3 pseudo-sites (10 random splits); central, merged (summed counts) and local-only references are compared on the same test subjects.
+
+\section{Results}
+\label{sec:results}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\linewidth]{fig1_system_overview.pdf}
+\caption{(a) Classification pathway and supervised subject-level AUCs (mean $\pm$ SD, 5 folds). (b) Scanning pathway: healthy reference, per-neuron histogram p-values and subset scan; Method~A scores of all 355 test subjects (pooled AUC 0.854); Top-1 re-identification from raw activations, quantised activations and p-values (10 bins). Panels marked ``illustration'' show the method, not data.}
+\label{fig:overview}
+\end{figure*}
+
+\begin{table}[t]
+\centering
+\caption{Supervised classifiers (subject level, 5-fold CV).}
+\label{tab:basemodels}
+\begin{tabular}{lcc}
+\hline
+\textbf{Model} & \textbf{AUC} & \textbf{Spec.\ @ 90\% sens.} \\
+\hline
+MiniROCKET~\cite{dempster2021minirocket} & 0.913 $\pm$ 0.050 & 0.774 \\
+PatchTST~\cite{nie2023patchtst} & 0.904 $\pm$ 0.054 & 0.737 \\
+InceptionTime~\cite{ismail2020inceptiontime} & 0.898 $\pm$ 0.049 & 0.683 \\
+BOSS+SGD~\cite{schafer2015boss} & 0.825 $\pm$ 0.054 & 0.439 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Label-free detection from histogram p-values of PatchTST layer-2 activations (N=10, held-out HC reference). Pooled AUC with bootstrap 95\% CI over 355 subjects; Spec.: specificity at 90\% sensitivity; L0/L1: mean AUC at layers 0 and 1.}
+\label{tab:deepscan}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Method} & \textbf{AUC} & \textbf{Pooled [95\% CI]} & \textbf{Spec.} & \textbf{L0 / L1} \\
+\hline
+A: mean p & 0.860 $\pm$ 0.067 & 0.854 [0.804, 0.899] & 0.546 & 0.850 / 0.848 \\
+B: per window & 0.851 $\pm$ 0.063 & 0.852 [0.806, 0.895] & 0.547 & 0.846 / 0.842 \\
+C: group & 0.839 $\pm$ 0.065 & 0.837 [0.788, 0.882] & 0.531 & 0.834 / 0.815 \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Detection.} Without labels at the scoring stage, all three methods separate PD from HC (Table~\ref{tab:deepscan}), 0.044--0.065 AUC below the supervised PatchTST classifier (Table~\ref{tab:basemodels}). The methods are statistically tied (A$-$C $+0.017$, 95\% CI $[-0.008, +0.042]$, $p{=}0.21$), and the layer matters little. Building the reference from the encoder's own training HC subjects instead gives the same AUC (Method~A 0.860), and restricting evaluation to the Relaxed task on the right wrist lowers it to 0.735, so the multi-task protocol matters. That a global mean does as well as subset searches is consistent with a diffuse PD signal spread across many neurons, rather than a stable subset of a few; we have not measured the selected subset sizes directly. At 90\% sensitivity, about 45\% of healthy controls would also be referred, which is the cost of a label-free screen.
+
+\textbf{The encoder carries the signal.} Compressed-input baselines that skip the encoder score below chance (0.419, 0.474 and 0.439 with directed p-values; 0.41--0.46 two-tailed). MiniROCKET is the best classifier, but scanning its 5{,}544 features per window with the same pipeline gives Method~A AUC 0.721 (paired difference to PatchTST $-0.138$, 95\% CI $[-0.202, -0.074]$) and histograms 43 times larger. A label-free scan weighs all features equally, so a representation shaped by supervised training matters more than classifier accuracy.
+
+\textbf{Merged reference.} Summed pseudo-site counts give exactly the central result in every fold (0.860), and each site sends 5{,}120 bytes. With about 21 HC per site, a site's own reference already reaches 0.859, so merging brings no detection gain at this size.
+
+\begin{table}[t]
+\centering
+\caption{Membership-inference AUC on a released histogram of $k$ volunteers (0.5 = no leakage), and Method~A detection AUC with the same noise.}
+\label{tab:membership}
+\begin{tabular}{lccc}
+\hline
+\textbf{$k$ volunteers} & \textbf{No noise} & \textbf{$\varepsilon{=}10$} & \textbf{$\varepsilon{=}1$} \\
+\hline
+5 & 0.942 & 0.543 & 0.483 \\
+10 & 0.869 & 0.530 & 0.518 \\
+20 & 0.795 & 0.546 & 0.501 \\
+\hline
+Detection AUC & 0.862 & 0.862 & 0.862 \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Privacy.} Plain histograms are not private: the attacker identifies contributors with AUC 0.94 for five volunteers, falling to 0.80 for twenty (Table~\ref{tab:membership}). Laplace noise brings membership to chance at $\varepsilon{=}10$ and $\varepsilon{=}1$ while Method~A detection is unchanged. (With a 10-window cap per volunteer the reference holds 130 windows per fold, hence 0.862 rather than 0.860.) Method~A survives because, with fixed edges, every neuron's p-value is non-increasing along its tail direction for any non-negative counts, so the ranking of subjects is largely preserved even when the counts are noisy. For re-identification, raw activations give 7.93\% Top-1 and p-values 5.76\% (chance 2.0\%), but activations simply quantised into the same 10 bins give 5.29\%: the reduction comes from binning, not from the p-value step, and with 50 or more bins p-values leak more than raw activations (8.44\%). Detection AUC is flat across bin counts (0.860--0.861).
+
+\textbf{Limitations.} One dataset and device; PD vs.\ HC only, and the one-tailed design would miss a disorder that shifts neurons the opposite way; 79 HC subjects; the bin count and layer were compared on cross-validated results, although detection is flat across both. Single-volunteer histograms and Methods~B and~C under noise are being evaluated, and we have not compared histogram p-values with raw empirical p-values directly.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Histogram-based subset scanning of a frozen encoder detects PD from smartwatch data without labels at the scoring stage, and healthy references can be merged exactly from contributed counts. The histograms themselves leak membership, so they should be released with differential-privacy noise, which on PADS costs no detection performance.
+
+\section{Compliance with ethical standards}
+\label{sec:ethics}
+
+This study was conducted retrospectively using human subject data made available in open access by PhysioNet (PADS~\cite{varghese2024pads}). Ethical approval was not required, as confirmed by the license attached to the open-access data.
+
+\section{Acknowledgments}
+\label{sec:acknowledgments}
+
+No funding was received for conducting this study. The authors have no relevant financial or non-financial interests to disclose. Code: \url{https://github.com/isaacmutuma/federated-subset-scanning-pads}.
+
+\bibliographystyle{IEEEbib}
+\bibliography{refs}
+
+\end{document}
