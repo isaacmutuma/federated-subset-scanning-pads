@@ -25,7 +25,7 @@ $^{3}$IBM Research Africa}
 \maketitle
 
 \begin{abstract}
-Kenya has fewer than 20 neurologists for about 56 million people, so Parkinson's disease (PD) often goes unrecognised. We study a smartwatch screen in which an encoder is trained once, healthy volunteers contribute only histogram counts of its internal activations to build a healthy reference, and each patient's watch scores its wearer locally against that reference. On the PADS dataset (355 subjects, 5-fold subject-level cross-validation), histogram-based subset scanning of PatchTST activations separates PD from healthy controls with AUC $0.860 \pm 0.067$ (pooled $0.854$, 95\% CI $[0.804, 0.899]$) with no labels at the scoring stage, against $0.904$ for the supervised classifier. Mean-p-value, per-window and group subset scans are statistically tied, and compressed-input baselines that skip the encoder fall below chance. With centrally fixed bin edges, summed counts reproduce the central reference exactly. The shared histograms are not private by themselves: a membership attack identifies the contributor of a single volunteer's histogram with AUC $0.99$, and of a five-volunteer histogram with AUC $0.93$. Laplace noise with $\varepsilon = 1$ brings membership to chance for every histogram size while all three detection methods keep their AUC.
+Kenya has fewer than 20 neurologists for about 56 million people, so Parkinson's disease (PD) often goes unrecognised. Smartwatch movement data could support screening, but confirmed PD labels are scarce where screening is needed, and both movement recordings and statistics computed from them can reveal who took part, which is itself sensitive health information. We study a screen in which a neural network is trained once, healthy volunteers contribute only histogram counts of its internal responses to build a healthy reference, and each patient's watch scores its wearer locally against that reference. On the Parkinson's Disease Smartwatch (PADS) dataset (355 subjects, 5-fold subject-level cross-validation), histogram-based subset scanning separates PD from healthy controls with AUC $0.860 \pm 0.067$ (pooled $0.854$, 95\% CI $[0.804, 0.899]$) with no labels at the scoring stage, against $0.904 \pm 0.054$ for a supervised classifier. Mean-p-value, per-window and group subset scans are statistically tied, and compressed-input baselines that skip the encoder fall below chance. With centrally fixed bin edges, summed counts reproduce the central reference exactly. The shared histograms are not private by themselves: a membership attack identifies the contributor of a single volunteer's histogram with AUC $0.99$, and of a five-volunteer histogram with AUC $0.93$. Laplace noise with $\varepsilon = 1$ brings membership to chance for every histogram size while all three detection methods keep their AUC. Healthy references can therefore be pooled across volunteers with a formal privacy guarantee; validation on further datasets and devices is the next step toward a pilot.
 \end{abstract}
 
 \begin{keywords}
@@ -35,7 +35,7 @@ Parkinson's disease, subset scanning, wearable sensors, differential privacy, an
 \section{Introduction}
 \label{sec:intro}
 
-Kenya has fewer than 20 neurologists for about 56.4 million people~\cite{sokhi2023kenya, worldbank2024kenya}, and Parkinson's disease (PD) there is often misdiagnosed or left undiagnosed~\cite{fothergill2021kenya}. Wrist-worn inertial sensors can capture motor symptoms continuously~\cite{cox2024devices}, and supervised models reach high accuracy on smartwatch data~\cite{varghese2024pads}. Deploying such a screen, however, raises two problems: confirmed PD labels are scarce where the screen is needed, and intermediate model representations can leak information about the people who produced them~\cite{hitaj2017gan, dai2025stealing}.
+Kenya has fewer than 20 neurologists for about 56.4 million people~\cite{sokhi2023kenya, worldbank2024kenya}, and Parkinson's disease (PD) there is often misdiagnosed or left undiagnosed~\cite{fothergill2021kenya}. Wrist-worn inertial sensors can capture motor symptoms continuously~\cite{cox2024devices}, and supervised models reach high accuracy on smartwatch data~\cite{varghese2024pads}. Deploying such a screen, however, raises two problems: confirmed PD labels are scarce where the screen is needed, and intermediate model representations can leak information about the people who produced them~\cite{hitaj2017gan, dai2025stealing}. Even aggregate statistics can reveal whether a person contributed to them~\cite{homer2008resolving}, and taking part in a movement-disorder study is itself sensitive.
 
 We study the following deployment. A PatchTST encoder~\cite{nie2023patchtst} is trained once, centrally, on labelled PD and healthy-control (HC) data, and the bin edges of a per-neuron histogram are fixed at the same time. Healthy volunteers contribute only integer histogram counts of the encoder's activations ($128 \times 10$ counts, about 5\,KB); the server sums them into a healthy reference and installs it on each monitored patient's watch, which scores its wearer locally and flags unusual movement for a clinician. Patient data never leave the watch; the privacy question concerns the volunteers. Detection uses histogram-based subset scanning~\cite{akumu2023deepscan}, which replaces stored background activations with per-neuron histograms but has so far been validated only on static inputs in a single centrally held dataset.
 
@@ -77,12 +77,14 @@ with the inequality reversed for neurons whose activation falls in PD. The direc
 
 \textbf{Evaluation.} Five-fold cross-validation, stratified by label and split by subject (per fold: 227 training, 57 validation, 71 test subjects). Per-channel normalisation uses training statistics only; HC windows are oversampled during training. We report subject-level AUC (mean $\pm$ SD over folds), the pooled AUC over all 355 test subjects with a bootstrap 95\% CI, a paired bootstrap test between methods, and specificity at 90\% sensitivity.
 
-\textbf{Baselines.} Supervised classifiers: MiniROCKET~\cite{dempster2021minirocket} (sktime, 1{,}000 kernels, ridge classifier), InceptionTime~\cite{ismail2020inceptiontime}, BOSS with an SGD classifier~\cite{schafer2015boss}, and the PatchTST classifier itself. Compressed-input baselines score mean-pooled segments (60 dims), statistical features (30) and PCA (60) of the raw window with Method~A, without the encoder.
+\textbf{Base models.} PatchTST: AdamW (learning rate $10^{-4}$, weight decay $10^{-2}$), cosine schedule, batch 32, dropout 0.3, up to 100 epochs with early stopping (patience 20) on validation loss. MiniROCKET~\cite{dempster2021minirocket}: sktime, 1{,}000 kernels (5{,}544 features on 6 channels), ridge classifier with cross-validated regularisation. InceptionTime~\cite{ismail2020inceptiontime}: a single network (no ensemble), 3 Inception blocks with 32 filters and kernel sizes 10/20/40, dropout 0.3, Adam (learning rate $10^{-3}$), batch 64, early stopping (patience 20). BOSS~\cite{schafer2015boss}: window 40, word length 4, 4 symbols per channel, linear SGD classifier (modified Huber loss, balanced classes). All are trained on the same windows and folds and evaluated by averaging window probabilities per subject. Compressed-input baselines score mean-pooled segments (60 dims), statistical features (30) and PCA (60) of the raw window with Method~A, without the encoder.
 
 \textbf{Merged reference.} The 63 HC subjects per fold (validation and training) are split into 3 pseudo-sites (10 random splits); central, merged (summed counts) and local-only references are compared on the same test subjects.
 
 \section{Results}
 \label{sec:results}
+
+The study proceeds in four steps: train base models and choose the encoder whose activations are scanned (Table~\ref{tab:basemodels}); score subjects with the three scanning methods and compare layers (Table~\ref{tab:deepscan}); test whether references merge exactly; and measure what the shared histograms reveal, with and without noise (Table~\ref{tab:membership}).
 
 \begin{figure*}[t]
 \centering
@@ -93,7 +95,7 @@ with the inequality reversed for neurons whose activation falls in PD. The direc
 
 \begin{table}[t]
 \centering
-\caption{Supervised classifiers (subject level, 5-fold CV).}
+\caption{Supervised classifiers (subject level, 5-fold CV; mean $\pm$ SD over folds). Spec.: specificity at 90\% sensitivity. All four need PD labels at training; MiniROCKET and PatchTST are the strongest.}
 \label{tab:basemodels}
 \begin{tabular}{lcc}
 \hline
@@ -109,7 +111,7 @@ BOSS+SGD~\cite{schafer2015boss} & 0.825 $\pm$ 0.054 & 0.439 \\
 
 \begin{table}[t]
 \centering
-\caption{Label-free detection from histogram p-values of PatchTST layer-2 activations (N=10, held-out HC reference). Pooled AUC with bootstrap 95\% CI over 355 subjects; Spec.: specificity at 90\% sensitivity; L0/L1: mean AUC at layers 0 and 1.}
+\caption{Label-free detection from histogram p-values of PatchTST layer-2 activations (N=10, held-out HC reference). Pooled AUC with bootstrap 95\% CI over 355 subjects; Spec.: specificity at 90\% sensitivity; L0/L1: mean AUC at layers 0 and 1. The three methods are statistically tied and all stay below the supervised classifiers of Table~\ref{tab:basemodels}, without needing labels at scoring time.}
 \label{tab:deepscan}
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{lcccc}
@@ -131,7 +133,7 @@ C: group & 0.839 $\pm$ 0.065 & 0.837 [0.788, 0.882] & 0.531 & 0.834 / 0.815 \\
 
 \begin{table}[t]
 \centering
-\caption{Top: membership-inference AUC on a released histogram of $k$ volunteers (0.5 = no leakage), for an attacker holding the windows the volunteer contributed / other windows of the same person. Bottom: detection AUC with the same noise (5 noise draws).}
+\caption{Top: membership-inference AUC on a released histogram of $k$ volunteers (0.5 = no leakage), for an attacker holding the windows the volunteer contributed / other windows of the same person. Bottom: detection AUC with the same noise (5 noise draws). Without noise even a single volunteer is exposed; at $\varepsilon{=}1$ membership is at chance and detection is unchanged.}
 \label{tab:membership}
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{lccc}
