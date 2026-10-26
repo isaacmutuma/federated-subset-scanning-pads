@@ -25,7 +25,7 @@ $^{3}$IBM Research Africa}
 \maketitle
 
 \begin{abstract}
-Kenya has fewer than 20 neurologists for about 56 million people, so Parkinson's disease (PD) often goes unrecognised. We study a smartwatch screen in which an encoder is trained once, healthy volunteers contribute only histogram counts of its internal activations to build a healthy reference, and each patient's watch scores its wearer locally against that reference. On the PADS dataset (355 subjects, 5-fold subject-level cross-validation), histogram-based subset scanning of PatchTST activations separates PD from healthy controls with AUC $0.860 \pm 0.067$ (pooled $0.854$, 95\% CI $[0.804, 0.899]$) with no labels at the scoring stage, against $0.904$ for the supervised classifier. Mean-p-value, per-window and group subset scans are statistically tied, and compressed-input baselines that skip the encoder fall below chance. With centrally fixed bin edges, summed counts reproduce the central reference exactly. The shared histograms are not private by themselves: a membership attack identifies contributors with AUC $0.94$ for histograms of five volunteers. Laplace noise with $\varepsilon = 1$ removes this leakage without changing detection.
+Kenya has fewer than 20 neurologists for about 56 million people, so Parkinson's disease (PD) often goes unrecognised. We study a smartwatch screen in which an encoder is trained once, healthy volunteers contribute only histogram counts of its internal activations to build a healthy reference, and each patient's watch scores its wearer locally against that reference. On the PADS dataset (355 subjects, 5-fold subject-level cross-validation), histogram-based subset scanning of PatchTST activations separates PD from healthy controls with AUC $0.860 \pm 0.067$ (pooled $0.854$, 95\% CI $[0.804, 0.899]$) with no labels at the scoring stage, against $0.904$ for the supervised classifier. Mean-p-value, per-window and group subset scans are statistically tied, and compressed-input baselines that skip the encoder fall below chance. With centrally fixed bin edges, summed counts reproduce the central reference exactly. The shared histograms are not private by themselves: a membership attack identifies the contributor of a single volunteer's histogram with AUC $0.99$, and of a five-volunteer histogram with AUC $0.93$. Laplace noise with $\varepsilon = 1$ brings membership to chance for every histogram size while all three detection methods keep their AUC.
 \end{abstract}
 
 \begin{keywords}
@@ -131,29 +131,33 @@ C: group & 0.839 $\pm$ 0.065 & 0.837 [0.788, 0.882] & 0.531 & 0.834 / 0.815 \\
 
 \begin{table}[t]
 \centering
-\caption{Membership-inference AUC on a released histogram of $k$ volunteers (0.5 = no leakage), and Method~A detection AUC with the same noise.}
+\caption{Top: membership-inference AUC on a released histogram of $k$ volunteers (0.5 = no leakage), for an attacker holding the windows the volunteer contributed / other windows of the same person. Bottom: detection AUC with the same noise (5 noise draws).}
 \label{tab:membership}
+\setlength{\tabcolsep}{4pt}
 \begin{tabular}{lccc}
 \hline
-\textbf{$k$ volunteers} & \textbf{No noise} & \textbf{$\varepsilon{=}10$} & \textbf{$\varepsilon{=}1$} \\
+\textbf{$k$} & \textbf{No noise} & \textbf{$\varepsilon{=}10$} & \textbf{$\varepsilon{=}1$} \\
 \hline
-5 & 0.942 & 0.543 & 0.483 \\
-10 & 0.869 & 0.530 & 0.518 \\
-20 & 0.795 & 0.546 & 0.501 \\
+1 & 0.994 / 0.656 & 0.532 / 0.509 & 0.496 / 0.465 \\
+5 & 0.934 / 0.582 & 0.528 / 0.498 & 0.498 / 0.490 \\
+10 & 0.875 / 0.578 & 0.533 / 0.509 & 0.506 / 0.498 \\
+20 & 0.777 / 0.546 & 0.550 / 0.503 & 0.509 / 0.510 \\
 \hline
-Detection AUC & 0.862 & 0.862 & 0.862 \\
+Method A & 0.860 & 0.863 & 0.863 \\
+Method B & 0.854 & 0.865 & 0.865 \\
+Method C & 0.839 & 0.851 & 0.849 \\
 \hline
 \end{tabular}
 \end{table}
 
-\textbf{Privacy.} Plain histograms are not private: the attacker identifies contributors with AUC 0.94 for five volunteers, falling to 0.80 for twenty (Table~\ref{tab:membership}). Laplace noise brings membership to chance at $\varepsilon{=}10$ and $\varepsilon{=}1$ while Method~A detection is unchanged. (With a 10-window cap per volunteer the reference holds 130 windows per fold, hence 0.862 rather than 0.860.) Method~A survives because, with fixed edges, every neuron's p-value is non-increasing along its tail direction for any non-negative counts, so the ranking of subjects is largely preserved even when the counts are noisy. For re-identification, raw activations give 7.93\% Top-1 and p-values 5.76\% (chance 2.0\%), but activations simply quantised into the same 10 bins give 5.29\%: the reduction comes from binning, not from the p-value step, and with 50 or more bins p-values leak more than raw activations (8.44\%). Detection AUC is flat across bin counts (0.860--0.861).
+\textbf{Privacy.} Plain histograms are not private (Table~\ref{tab:membership}). A single volunteer's histogram identifies them almost certainly (AUC 0.994), and still with AUC 0.66 when the attacker only holds a new recording of the person; leakage falls as more volunteers are pooled (0.93, 0.88, 0.78 for 5, 10, 20). Laplace noise brings membership to chance for every histogram size at $\varepsilon{=}1$, and all three detection methods keep their AUC under the noise (A 0.863, B 0.865, C 0.849). The detection rows use a reference capped at 10 windows per volunteer (130 windows per fold). Detection survives because, with fixed edges, every neuron's p-value is non-increasing along its tail direction for any non-negative counts, so the ordering of activations is preserved even when the counts are noisy. For re-identification, raw activations give 7.93\% Top-1 and p-values 5.76\% (chance 2.0\%), but activations simply quantised into the same 10 bins give 5.29\%: the reduction comes from binning, not from the p-value step, and with 50 or more bins p-values leak more than raw activations (8.44\%). Detection AUC is flat across bin counts (0.860--0.861).
 
-\textbf{Limitations.} One dataset and device; PD vs.\ HC only, and the one-tailed design would miss a disorder that shifts neurons the opposite way; 79 HC subjects; the bin count and layer were compared on cross-validated results, although detection is flat across both. Single-volunteer histograms and Methods~B and~C under noise are being evaluated, and we have not compared histogram p-values with raw empirical p-values directly.
+\textbf{Limitations.} One dataset and device; PD vs.\ HC only, and the one-tailed design would miss a disorder that shifts neurons the opposite way; 79 HC subjects; the bin count and layer were compared on cross-validated results, although detection is flat across both. We have not compared histogram p-values with raw empirical p-values directly.
 
 \section{Conclusion}
 \label{sec:conclusion}
 
-Histogram-based subset scanning of a frozen encoder detects PD from smartwatch data without labels at the scoring stage, and healthy references can be merged exactly from contributed counts. The histograms themselves leak membership, so they should be released with differential-privacy noise, which on PADS costs no detection performance.
+Histogram-based subset scanning of a frozen encoder detects PD from smartwatch data without labels at the scoring stage, and healthy references can be merged exactly from contributed counts. The histograms themselves leak membership, down to a single contributor, so they should be released with differential-privacy noise, which on PADS costs no detection performance for any of the three scoring methods.
 
 \section{Compliance with ethical standards}
 \label{sec:ethics}
