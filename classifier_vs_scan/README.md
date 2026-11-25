@@ -28,6 +28,10 @@ scores (10% of healthy people referred). Volunteers are scored leave-one-subject
 | `exp2_population_shift.py` | Shifted population (amplitude, noise, 25 Hz, rotated watch, slower movement, combined) with local re-referencing | per shift: `scan_A` beats both `clf_K1` and `clf_K2` on sensitivity at 10% referral (HC vs PD+DD), CIs above 0 |
 | `exp3_private_references.py` | Histograms vs diagonal / full Gaussian references under equal person-level ε-DP | at ε = 1: `hist − diag_gauss` and `hist − full_gauss` pooled AUC CIs above 0 |
 | `exp4_label_free_encoder.py` | Encoder trained without labels (masked-patch reconstruction; `ssl_hc` = healthy only, `ssl_all` = all windows, labels dropped) | no pass/fail: reports the AUC cost of a label-free pipeline |
+| `exp5_monitoring.py` | Monitoring: does a person's follow-up differ from their own baseline? Simulated within one PADS session (baseline = windows 1–3, follow-up = windows 4–5 with injected tremor 4–6 / 8–12 Hz, slowing, irregular movement, amplitude) | at strength 0.5, personal two-tailed scan beats the classifier trend (signed and absolute) for ≥ 2 of the 3 non-PD changes |
+
+PADS records each person once, so exp 5 simulates change; real monitoring needs longitudinal data
+(candidates: BEAT-PD / CIS-PD + REAL-PD, mPower, PPMI Verily Study Watch, WearGait-PD Longitudinal).
 
 Note: the main paper is PD vs HC only. DD subjects appear here **only** in this side study
 (exp 1, and as part of the screened population in exp 2/4).
@@ -51,4 +55,4 @@ exp 1/2), `N_DRAWS`, `N_REPEATS` (exp 3), `VARIANTS`, `EPOCHS` (exp 4).
 
 `features/<shift>/fold<k>.npz`, `features/dd_diagnosis.json`, `exp1_unseen_disorders.json`,
 `exp2_population_shift.json`, `exp3_private_references.json`, `exp4_label_free_encoder.json`,
-`ssl_ckpt/`, `features_ssl/`. Each JSON stores its config and git commit.
+`exp5_monitoring.json`, `exp5_scores/`, `ssl_ckpt/`, `features_ssl/`. Each JSON stores its config and git commit.

@@ -26,7 +26,8 @@ checkpoints and config are only read, and all outputs go to `RESULTS_DIR/classif
 | 5 | **Exp 2** — population shift with local re-referencing | ~10 min |
 | 6 | **Exp 3** — histograms vs simpler trackers at equal privacy | ~10 min |
 | 7 | **Exp 4** — encoder trained without labels (masked reconstruction) | ~30–60 min |
-| 8 | Summary + backup | 1 min |
+| 8 | **Exp 5** — monitoring: change vs the person's own baseline (simulated) | ~20–30 min |
+| 9 | Summary + backup | 1 min |
 
 Each experiment states its decision rule (fixed before the run) at the top of its script.
 """)
@@ -118,17 +119,28 @@ code("""
 !python classifier_vs_scan/exp4_label_free_encoder.py > /content/cvs_exp4.log 2>&1; grep -E "pretrain|saved" /content/cvs_exp4.log | tail -12; tail -n 30 /content/cvs_exp4.log
 """)
 
-md("## 8. Summary and backup")
+md("""
+## 8. Experiment 5 — monitoring a person over time (simulated)
+Personal baseline = windows 1–3 of each recording; follow-up = windows 4–5, unchanged or with a simulated
+change (tremor 4–6 Hz / 8–12 Hz, slowing, irregular movement, amplitude). Rule: at strength 0.5, the personal
+two-tailed scan beats the classifier trend (signed and absolute) for ≥ 2 of the 3 non-PD changes.
+Per-fold scores are cached, so a restart resumes.
+""")
+code("""
+!python classifier_vs_scan/exp5_monitoring.py > /content/cvs_exp5.log 2>&1; grep -E "done|cached" /content/cvs_exp5.log | tail -5; tail -n 45 /content/cvs_exp5.log
+""")
+
+md("## 9. Summary and backup")
 code("""
 import json, shutil, datetime
 def load(n):
     p = os.path.join(CVS_DIR, n)
     return json.load(open(p)) if os.path.exists(p) else None
-for name in ['exp1_unseen_disorders.json', 'exp2_population_shift.json', 'exp3_private_references.json']:
+for name in ['exp1_unseen_disorders.json', 'exp2_population_shift.json', 'exp3_private_references.json', 'exp5_monitoring.json']:
     r = load(name)
     if r is None:
         print('[missing]', name); continue
-    rules = [r['rule']] if 'rule' in r else [v['rule'] for v in r.get('by_shift', {}).values()] or [r['summary']['rule']]
+    rules = [r['rule']] if r.get('rule') is not None else [v['rule'] for v in r.get('by_shift', {}).values()] or [r['summary']['rule']]
     print(name, '->', rules)
 stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M')
 bdir = f'/content/drive/MyDrive/results_backup_cvs_{stamp}'
