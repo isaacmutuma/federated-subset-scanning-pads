@@ -27,7 +27,12 @@ checkpoints and config are only read, and all outputs go to `RESULTS_DIR/classif
 | 6 | **Exp 3** — histograms vs simpler trackers at equal privacy | ~10 min |
 | 7 | **Exp 4** — encoder trained without labels (masked reconstruction) | ~30–60 min |
 | 8 | **Exp 5** — monitoring: change vs the person's own baseline (simulated) | ~20–30 min |
-| 9 | Summary + backup | 1 min |
+| 10 | Real home data: fetch Habets (20 PD, 14 days, symptom reports) + **Exp 6** | ~20 + ~20 min |
+| 11 | Real healthy data: fetch IMU50 (50 healthy, 5 days) + **Exp 7** false alarms | ~1–2 h + ~30 min |
+| 9 | Summary + backup (run last) | 1 min |
+
+Sections 10–11 need no GPU for the fetch step and no data on Drive beforehand: they read the open
+datasets straight from DataverseNL / Zenodo with byte-range requests and keep only the windows used.
 
 Each experiment states its decision rule (fixed before the run) at the top of its script.
 """)
@@ -130,13 +135,38 @@ code("""
 !python classifier_vs_scan/exp5_monitoring.py > /content/cvs_exp5.log 2>&1; grep -E "done|cached" /content/cvs_exp5.log | tail -5; tail -n 45 /content/cvs_exp5.log
 """)
 
+md("""
+## 10. Real monitoring — Habets home data (Exp 6)
+20 people with PD at home for ~14 days, both wrists, ~7 symptom questionnaires a day (CC0,
+doi:10.34894/5HHK8H). The fetch keeps only the 10 minutes before each questionnaire (~0.3 GB, resumable).
+Rule: the personal scan's within-person correlation with self-reported motor symptoms has CI > 0 and beats
+both the classifier P(PD) and plain movement intensity (paired CIs > 0).
+""")
+code("""
+!python classifier_vs_scan/habets_fetch.py 2>&1 | tail -n 25
+!python classifier_vs_scan/exp6_habets_monitoring.py > /content/cvs_exp6.log 2>&1; tail -n 30 /content/cvs_exp6.log
+""")
+
+md("""
+## 11. False alarms in healthy people — IMU50 (Exp 7)
+50 healthy adults, 5 days free living, non-dominant wrist (CC BY 4.0, Zenodo 21468410). The 46.7 GB zip is
+streamed, never stored; only the first 10 minutes of each daytime hour are kept. CPU-bound (csv parsing);
+WORKERS=4 subjects in parallel. Resumable: re-run the cell if the runtime disconnects.
+Rule: median per-person false-alarm rate of the personal scan <= 10% and flagged days <= 10%.
+""")
+code("""
+!WORKERS=4 python classifier_vs_scan/imu50_fetch.py 2>&1 | tail -n 55
+!python classifier_vs_scan/exp7_imu50_false_alarms.py > /content/cvs_exp7.log 2>&1; tail -n 14 /content/cvs_exp7.log
+""")
+
 md("## 9. Summary and backup")
 code("""
 import json, shutil, datetime
 def load(n):
     p = os.path.join(CVS_DIR, n)
     return json.load(open(p)) if os.path.exists(p) else None
-for name in ['exp1_unseen_disorders.json', 'exp2_population_shift.json', 'exp3_private_references.json', 'exp5_monitoring.json']:
+for name in ['exp1_unseen_disorders.json', 'exp2_population_shift.json', 'exp3_private_references.json', 'exp5_monitoring.json',
+             'exp6_habets_monitoring.json', 'exp7_imu50_false_alarms.json']:
     r = load(name)
     if r is None:
         print('[missing]', name); continue
@@ -146,7 +176,7 @@ stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M')
 bdir = f'/content/drive/MyDrive/results_backup_cvs_{stamp}'
 os.makedirs(bdir, exist_ok=True)
 for f in os.listdir(CVS_DIR):
-    if f.endswith('.json'):
+    if f.endswith('.json') or f.endswith('_scores.csv'):
         shutil.copy(os.path.join(CVS_DIR, f), bdir)
 print('backup ->', bdir)
 """)
